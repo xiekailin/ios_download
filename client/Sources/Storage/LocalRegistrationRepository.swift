@@ -12,12 +12,13 @@ public actor LocalRegistrationRepository: RegistrationStore {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private let service = "xdownloader.device-registration"
-    private let account = "default"
+    private let account: String
 
-    public init(storageURL: URL? = nil) {
+    public init(storageURL: URL? = nil, account: String = "default") {
         let defaultURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appending(path: "xdownloader_device.json")
         self.storageURL = storageURL ?? defaultURL
+        self.account = account
     }
 
     public func loadRegistration() throws -> DeviceRegistration? {

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 import os
+from urllib.parse import parse_qsl, urlparse
 
 from app.core.errors import ValidationAppError
 
@@ -13,6 +14,10 @@ def _default_data_dir() -> Path:
 
 def _default_artifacts_dir() -> Path:
     return Path.home() / "Downloads" / "XDownloader"
+
+
+def _default_youtube_cookies_file() -> Path:
+    return _default_data_dir() / "youtube" / "cookies.txt"
 
 
 def _get_int_env(name: str, default: int) -> int:
@@ -45,63 +50,127 @@ def _get_positive_int_env(name: str, default: int) -> int:
     return value
 
 
+def _is_youtube_url(source_url: str) -> bool:
+    parsed = urlparse(source_url.strip())
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.rstrip("/")
+    if host in {"youtube.com", "www.youtube.com", "m.youtube.com"}:
+        if path == "/watch":
+            return bool(dict(parse_qsl(parsed.query, keep_blank_values=True)).get("v"))
+        return path.startswith("/shorts/") and bool(path.removeprefix("/shorts/").split("/", maxsplit=1)[0])
+    return host == "youtu.be" and bool(parsed.path.strip("/")) and "/" not in parsed.path.strip("/")
+
+
 @dataclass(slots=True)
 class Settings:
     app_name: str = "X Downloader API"
     env: str = "development"
+    cloud_mode: bool = False
     bootstrap_code: str = ""
+    local_secret: str = ""
     database_path: Path = field(default_factory=lambda: _default_data_dir() / "app.db")
     artifacts_dir: Path = field(default_factory=_default_artifacts_dir)
     yt_dlp_binary: str = "yt-dlp"
-    youtube_cookies_from_browser: str | None = None
+    youtube_cookies_from_browser: str | None = "chrome"
+    youtube_cookies_disabled: bool = False
+    youtube_cookies_file: Path = field(default_factory=_default_youtube_cookies_file)
+    youtube_cookies_max_bytes: int = 2 * 1024 * 1024
     youtube_js_runtime: str | None = None
     youtube_remote_components: str | None = None
     ffmpeg_binary: str = "ffmpeg"
     provider_timeout_seconds: int = 180
-    download_max_bytes: int = 512 * 1024 * 1024
+    download_max_bytes: int = 10 * 1024 * 1024 * 1024
     worker_enabled: bool = True
     worker_max_jobs: int = 2
     register_rate_limit: int = 5
     register_window_seconds: int = 300
+    audio_upload_max_bytes: int = 200 * 1024 * 1024
+    audio_separation_command: str = ""
+    audio_separation_timeout_seconds: int = 1800
 
     @property
     def yt_dlp_command(self) -> list[str]:
-        if not self.yt_dlp_binary.strip() or any(char.isspace() for char in self.yt_dlp_binary):
+        if not self.yt_dlp_binary.strip():
             raise ValidationAppError("invalid yt-dlp binary", "环境变量 XDL_YT_DLP_BINARY 配置不正确。")
         return [self.yt_dlp_binary]
 
     def youtube_runtime_args(self, source_url: str) -> list[str]:
-        if "youtube.com/" not in source_url and "youtu.be/" not in source_url:
+        if not _is_youtube_url(source_url):
             return []
         args: list[str] = []
         if self.youtube_js_runtime:
             args.extend(["--js-runtimes", self.youtube_js_runtime])
         if self.youtube_remote_components:
             args.extend(["--remote-components", self.youtube_remote_components])
-        if self.youtube_cookies_from_browser:
-            args.extend(["--cookies-from-browser", self.youtube_cookies_from_browser])
         return args
+
+    def youtube_cookie_retry_args(self, source_url: str) -> list[str]:
+        if not _is_youtube_url(source_url) or self.youtube_cookies_disabled:
+            return []
+        args: list[str] = []
+        if self.youtube_js_runtime:
+            args.extend(["--js-runtimes", self.youtube_js_runtime])
+        if self.youtube_cookies_file.exists() and self.youtube_cookies_file.stat().st_size > 0:
+            args.extend(["--cookies", str(self.youtube_cookies_file)])
+            return args
+        if not self.youtube_cookies_from_browser:
+            return []
+        args.extend(["--cookies-from-browser", self.youtube_cookies_from_browser])
+        return args
+
+    def youtube_cookie_retry_command(self, command: list[str], source_url: str) -> list[str]:
+        retry_args = self.youtube_cookie_retry_args(source_url)
+        if not retry_args:
+            return []
+        return [*self._without_remote_components(command[:-2]), *retry_args, *command[-2:]]
+
+    def _without_remote_components(self, args: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        skip_next = False
+        for arg in args:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg == "--remote-components":
+                skip_next = True
+                continue
+            cleaned.append(arg)
+        return cleaned
 
     @classmethod
     def from_env(cls) -> "Settings":
         data_dir = Path(os.getenv("XDL_DATA_DIR", _default_data_dir()))
+        cloud_mode = _get_bool_env("XDL_CLOUD_MODE", False)
+        bootstrap_code = os.getenv("XDL_BOOTSTRAP_CODE", "")
+        if cloud_mode and not bootstrap_code:
+            raise ValueError("XDL_BOOTSTRAP_CODE is required when XDL_CLOUD_MODE is true")
         return cls(
             app_name=os.getenv("XDL_APP_NAME", "X Downloader API"),
             env=os.getenv("XDL_ENV", "development"),
-            bootstrap_code=os.getenv("XDL_BOOTSTRAP_CODE", ""),
+            cloud_mode=cloud_mode,
+            bootstrap_code=bootstrap_code,
+            local_secret=os.getenv("XDL_LOCAL_SECRET", ""),
             database_path=Path(os.getenv("XDL_DATABASE_PATH", data_dir / "app.db")),
             artifacts_dir=Path(os.getenv("XDL_ARTIFACTS_DIR", _default_artifacts_dir())),
             yt_dlp_binary=os.getenv("XDL_YT_DLP_BINARY", "yt-dlp"),
-            youtube_cookies_from_browser=os.getenv("XDL_YOUTUBE_COOKIES_FROM_BROWSER") or None,
+            youtube_cookies_from_browser=os.getenv("XDL_YOUTUBE_COOKIES_FROM_BROWSER") or "chrome",
+            youtube_cookies_disabled=_get_bool_env("XDL_YOUTUBE_COOKIES_DISABLED", False),
+            youtube_cookies_file=Path(os.getenv("XDL_YOUTUBE_COOKIES_FILE", data_dir / "youtube" / "cookies.txt")),
+            youtube_cookies_max_bytes=_get_positive_int_env("XDL_YOUTUBE_COOKIES_MAX_BYTES", 2 * 1024 * 1024),
             youtube_js_runtime=os.getenv("XDL_YOUTUBE_JS_RUNTIME") or None,
             youtube_remote_components=os.getenv("XDL_YOUTUBE_REMOTE_COMPONENTS") or None,
             ffmpeg_binary=os.getenv("XDL_FFMPEG_BINARY", "ffmpeg"),
             provider_timeout_seconds=_get_positive_int_env("XDL_PROVIDER_TIMEOUT", 180),
-            download_max_bytes=_get_positive_int_env("XDL_DOWNLOAD_MAX_BYTES", 512 * 1024 * 1024),
+            download_max_bytes=_get_positive_int_env("XDL_DOWNLOAD_MAX_BYTES", 10 * 1024 * 1024 * 1024),
             worker_enabled=_get_bool_env("XDL_WORKER_ENABLED", True),
             worker_max_jobs=_get_positive_int_env("XDL_WORKER_MAX_JOBS", 2),
             register_rate_limit=_get_positive_int_env("XDL_REGISTER_RATE_LIMIT", 5),
             register_window_seconds=_get_positive_int_env("XDL_REGISTER_WINDOW_SECONDS", 300),
+            audio_upload_max_bytes=_get_positive_int_env("XDL_AUDIO_UPLOAD_MAX_BYTES", 200 * 1024 * 1024),
+            audio_separation_command=os.getenv("XDL_AUDIO_SEPARATION_COMMAND", ""),
+            audio_separation_timeout_seconds=_get_positive_int_env("XDL_AUDIO_SEPARATION_TIMEOUT", 1800),
         )
 
     def ensure_directories(self) -> None:

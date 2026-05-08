@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import hmac
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -22,6 +23,25 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="X Downloader API", version="0.1.0", lifespan=lifespan)
 app.include_router(api_router)
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
+
+
+@app.middleware("http")
+async def verify_local_secret(request: Request, call_next):
+    if request.url.path.startswith("/api/"):
+        settings = request.app.state.container.settings
+        if settings.cloud_mode:
+            return await call_next(request)
+        client_host = request.client.host if request.client else ""
+        if client_host not in _LOOPBACK_HOSTS:
+            return JSONResponse(status_code=403, content={"error": {"code": "local_service_forbidden", "message": "local service only accepts loopback requests", "user_message": "本地后端只允许本机访问。", "details": {}}})
+        if request.url.path != "/api/v1/health":
+            secret = settings.local_secret
+            provided_secret = request.headers.get("X-XDownloader-Local-Secret", "")
+            if not secret or not hmac.compare_digest(provided_secret, secret):
+                return JSONResponse(status_code=403, content={"error": {"code": "local_service_untrusted", "message": "local service secret mismatch", "user_message": "本地后端校验失败，请重启应用。", "details": {}}})
+    return await call_next(request)
 
 
 @app.exception_handler(AppError)

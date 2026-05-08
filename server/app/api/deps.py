@@ -13,8 +13,28 @@ from app.services.artifacts import ArtifactService
 from app.services.database import Database
 from app.services.devices import DeviceService, RegisterRateLimiter
 from app.services.jobs import BackgroundJobRunner, JobService
-from app.services.repositories import ArtifactRepository, DeviceRepository, JobRepository, RegisterAttemptRepository
+from app.services.repositories import ArtifactRepository, DeviceRepository, JobEventRepository, JobRepository, RegisterAttemptRepository
+from app.domain.models import JobType
+from app.workers.audio_separation_job_worker import AudioSeparationJobWorker
 from app.workers.download_job_worker import DownloadJobWorker
+
+
+class JobWorkerDispatcher:
+    def __init__(self, jobs: JobRepository, download_worker: DownloadJobWorker, audio_worker: AudioSeparationJobWorker) -> None:
+        self._jobs = jobs
+        self._download_worker = download_worker
+        self._audio_worker = audio_worker
+        self._selector = download_worker._selector
+        self._downloader = download_worker._downloader
+
+    def run(self, job_id: str) -> None:
+        job = self._jobs.get(job_id)
+        if job is None:
+            return
+        if job.job_type == JobType.AUDIO_SEPARATION:
+            self._audio_worker.run(job_id)
+            return
+        self._download_worker.run(job_id)
 
 
 @dataclass(slots=True)
@@ -38,13 +58,20 @@ def build_container() -> AppContainer:
     register_attempt_repository = RegisterAttemptRepository(database)
     job_repository = JobRepository(database)
     artifact_repository = ArtifactRepository(database)
+    job_event_repository = JobEventRepository(database)
     selector = ProviderSelector([XProvider(), YtDlpProvider(settings)])
-    worker = DownloadJobWorker(
+    download_worker = DownloadJobWorker(
         settings=settings,
         jobs=job_repository,
         artifacts=artifact_repository,
         selector=selector,
     )
+    audio_worker = AudioSeparationJobWorker(
+        settings=settings,
+        jobs=job_repository,
+        artifacts=artifact_repository,
+    )
+    worker = JobWorkerDispatcher(job_repository, download_worker, audio_worker)
     return AppContainer(
         settings=settings,
         database=database,
@@ -61,7 +88,9 @@ def build_container() -> AppContainer:
                 enabled=settings.worker_enabled,
             ),
             artifact_repository,
+            job_event_repository,
             settings,
+            selector,
         ),
         artifact_service=ArtifactService(settings, artifact_repository, job_repository),
     )

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 import sqlite3
 import uuid
+from urllib.parse import urlsplit, urlunsplit
 
 from app.core.errors import ConflictAppError
-from app.domain.models import Artifact, Device, Job, JobStatus, Platform
+from app.domain.models import Artifact, ArtifactRole, Device, Job, JobEvent, JobStatus, JobType, Platform
 from app.services.database import Database, utc_now
 
 _ACTIVE_JOB_STATUSES = (
@@ -22,6 +24,11 @@ _TERMINAL_JOB_STATUSES = (
     JobStatus.FAILED,
     JobStatus.CANCELED,
 )
+
+_MAX_JOB_EVENTS_PER_JOB = 500
+_SECRET_TEXT_RE = re.compile(r"(?i)(authorization|cookie|token|secret|sid)=?\s*[:=]\s*[^\s&]+")
+_LOCAL_PATH_RE = re.compile(r"/(?:Users|private|var|tmp)/[^\s]+")
+_URL_RE = re.compile(r"https?://[^\s]+")
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -114,13 +121,23 @@ class JobRepository:
     def __init__(self, database: Database) -> None:
         self._database = database
 
-    def create(self, *, device_id: str, source_url: str, normalized_url: str, selected_quality: str | None) -> Job:
+    def create(
+        self,
+        *,
+        device_id: str,
+        source_url: str,
+        normalized_url: str,
+        selected_quality: str | None,
+        job_type: JobType = JobType.DOWNLOAD,
+        media_title: str | None = None,
+    ) -> Job:
         now = utc_now()
         job = Job(
             id=str(uuid.uuid4()),
             device_id=device_id,
             source_url=source_url,
             normalized_url=normalized_url,
+            job_type=job_type,
             provider=None,
             status=JobStatus.QUEUED,
             progress=0,
@@ -131,7 +148,7 @@ class JobRepository:
             error_code=None,
             error_message=None,
             user_message=None,
-            media_title=None,
+            media_title=media_title,
             author_handle=None,
             thumbnail_url=None,
             artifact_id=None,
@@ -140,23 +157,24 @@ class JobRepository:
             updated_at=now,
             finished_at=None,
         )
-        dedupe_key = f"{device_id}:{normalized_url}"
+        dedupe_key = f"{device_id}:{job_type.value}:{normalized_url}"
         try:
             with self._database.connection() as conn:
                 conn.execute(
                     """
                     INSERT INTO jobs (
-                        id, device_id, source_url, normalized_url, dedupe_key, is_active, provider, status, progress,
+                        id, device_id, source_url, normalized_url, job_type, dedupe_key, is_active, provider, status, progress,
                         downloaded_bytes, total_bytes, speed_bytes_per_sec, eta_seconds,
                         error_code, error_message, user_message, media_title, author_handle,
                         thumbnail_url, artifact_id, selected_quality, created_at, updated_at, finished_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         job.id,
                         job.device_id,
                         job.source_url,
                         job.normalized_url,
+                        job.job_type.value,
                         dedupe_key,
                         1,
                         job.provider,
@@ -181,7 +199,7 @@ class JobRepository:
                 )
                 conn.commit()
         except sqlite3.IntegrityError as exc:
-            active_job = self.get_active_for_device_url(device_id, normalized_url)
+            active_job = self.get_active_for_device_url(device_id, normalized_url, job_type=job_type)
             if active_job is not None:
                 raise ConflictAppError("active job already exists", "相同链接已有任务在处理中。") from exc
             raise
@@ -192,12 +210,12 @@ class JobRepository:
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return _row_to_job(row) if row else None
 
-    def get_active_for_device_url(self, device_id: str, normalized_url: str) -> Job | None:
+    def get_active_for_device_url(self, device_id: str, normalized_url: str, *, job_type: JobType = JobType.DOWNLOAD) -> Job | None:
         placeholders = ",".join("?" for _ in _ACTIVE_JOB_STATUSES)
-        params = (device_id, normalized_url, *[status.value for status in _ACTIVE_JOB_STATUSES])
+        params = (device_id, normalized_url, job_type.value, *[status.value for status in _ACTIVE_JOB_STATUSES])
         with self._database.connection() as conn:
             row = conn.execute(
-                f"SELECT * FROM jobs WHERE device_id = ? AND normalized_url = ? AND status IN ({placeholders}) ORDER BY created_at DESC LIMIT 1",
+                f"SELECT * FROM jobs WHERE device_id = ? AND normalized_url = ? AND job_type = ? AND status IN ({placeholders}) ORDER BY created_at DESC LIMIT 1",
                 params,
             ).fetchone()
         return _row_to_job(row) if row else None
@@ -209,6 +227,19 @@ class JobRepository:
                 (device_id,),
             ).fetchall()
         return [_row_to_job(row) for row in rows]
+
+    def get_latest_completed_for_device_url(self, device_id: str, normalized_url: str, *, job_type: JobType = JobType.DOWNLOAD) -> Job | None:
+        with self._database.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE device_id = ? AND normalized_url = ? AND job_type = ? AND status = ?
+                ORDER BY finished_at DESC, updated_at DESC, created_at DESC
+                LIMIT 1
+                """,
+                (device_id, normalized_url, job_type.value, JobStatus.COMPLETED.value),
+            ).fetchone()
+        return _row_to_job(row) if row else None
 
     def transition_status(
         self,
@@ -331,31 +362,117 @@ class JobRepository:
             )
             conn.commit()
 
+    def create_event(self, job_id: str, *, level: str, event_type: str, message: str) -> JobEvent:
+        return JobEventRepository(self._database).create(job_id=job_id, level=level, event_type=event_type, message=message)
+
+    def clear_artifact(self, job_id: str, artifact_id: str) -> None:
+        with self._database.connection() as conn:
+            conn.execute(
+                "UPDATE jobs SET artifact_id = NULL, updated_at = ? WHERE id = ? AND artifact_id = ?",
+                (utc_now().isoformat(), job_id, artifact_id),
+            )
+            conn.commit()
+
     def delete(self, job_id: str) -> None:
         with self._database.connection() as conn:
+            conn.execute("DELETE FROM job_events WHERE job_id = ?", (job_id,))
             conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
             conn.commit()
+
+
+class JobEventRepository:
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    def create(self, *, job_id: str, level: str, event_type: str, message: str) -> JobEvent:
+        created_at = utc_now()
+        safe_message = _redact_job_event_message(message)
+        with self._database.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO job_events (job_id, level, event_type, message, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (job_id, level, event_type, safe_message, created_at.isoformat()),
+            )
+            event_id = int(cursor.lastrowid)
+            conn.execute(
+                """
+                DELETE FROM job_events
+                WHERE job_id = ? AND id NOT IN (
+                    SELECT id FROM job_events WHERE job_id = ? ORDER BY id DESC LIMIT ?
+                )
+                """,
+                (job_id, job_id, _MAX_JOB_EVENTS_PER_JOB),
+            )
+            conn.commit()
+        return JobEvent(id=event_id, job_id=job_id, level=level, event_type=event_type, message=safe_message, created_at=created_at)
+
+    def list_for_job(self, job_id: str, *, limit: int = 200, after_id: int | None = None) -> list[JobEvent]:
+        bounded_limit = min(max(limit, 1), 500)
+        params: tuple[object, ...]
+        if after_id is None:
+            where_clause = "job_id = ?"
+            params = (job_id, bounded_limit)
+        else:
+            where_clause = "job_id = ? AND id > ?"
+            params = (job_id, after_id, bounded_limit)
+        with self._database.connection() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM job_events WHERE {where_clause} ORDER BY id ASC LIMIT ?",
+                params,
+            ).fetchall()
+        return [_row_to_job_event(row) for row in rows]
 
 
 class ArtifactRepository:
     def __init__(self, database: Database) -> None:
         self._database = database
 
-    def create(self, *, job_id: str, file_name: str, mime_type: str, storage_path: str, file_size: int) -> Artifact:
+    def create(
+        self,
+        *,
+        job_id: str,
+        file_name: str,
+        mime_type: str,
+        storage_path: str,
+        file_size: int,
+        thumbnail_path: str | None = None,
+        role: ArtifactRole = ArtifactRole.MEDIA,
+        duration_seconds: float | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        video_codec: str | None = None,
+        audio_codec: str | None = None,
+        bitrate_kbps: int | None = None,
+        container_format: str | None = None,
+    ) -> Artifact:
         artifact = Artifact(
             id=str(uuid.uuid4()),
             job_id=job_id,
             file_name=file_name,
             mime_type=mime_type,
             storage_path=storage_path,
+            thumbnail_path=thumbnail_path,
+            role=role,
             file_size=file_size,
+            duration_seconds=duration_seconds,
+            width=width,
+            height=height,
+            video_codec=video_codec,
+            audio_codec=audio_codec,
+            bitrate_kbps=bitrate_kbps,
+            container_format=container_format,
             created_at=utc_now(),
         )
         with self._database.connection() as conn:
             conn.execute(
                 """
-                INSERT INTO artifacts (id, job_id, file_name, mime_type, storage_path, file_size, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO artifacts (
+                    id, job_id, file_name, mime_type, storage_path, thumbnail_path, role, file_size,
+                    duration_seconds, width, height, video_codec, audio_codec, bitrate_kbps, container_format,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     artifact.id,
@@ -363,7 +480,16 @@ class ArtifactRepository:
                     artifact.file_name,
                     artifact.mime_type,
                     artifact.storage_path,
+                    artifact.thumbnail_path,
+                    artifact.role.value,
                     artifact.file_size,
+                    artifact.duration_seconds,
+                    artifact.width,
+                    artifact.height,
+                    artifact.video_codec,
+                    artifact.audio_codec,
+                    artifact.bitrate_kbps,
+                    artifact.container_format,
                     artifact.created_at.isoformat(),
                 ),
             )
@@ -375,10 +501,35 @@ class ArtifactRepository:
             row = conn.execute("SELECT * FROM artifacts WHERE id = ?", (artifact_id,)).fetchone()
         return _row_to_artifact(row) if row else None
 
+    def list_for_job(self, job_id: str) -> list[Artifact]:
+        with self._database.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM artifacts WHERE job_id = ? ORDER BY created_at ASC",
+                (job_id,),
+            ).fetchall()
+        return [_row_to_artifact(row) for row in rows]
+
     def delete(self, artifact_id: str) -> None:
         with self._database.connection() as conn:
             conn.execute("DELETE FROM artifacts WHERE id = ?", (artifact_id,))
             conn.commit()
+
+
+def _redact_job_event_message(message: str) -> str:
+    redacted = _SECRET_TEXT_RE.sub("[已隐藏敏感信息]", message)
+    redacted = _LOCAL_PATH_RE.sub("[本地路径]", redacted)
+    return _URL_RE.sub(_redact_url_query, redacted)
+
+
+def _redact_url_query(match: re.Match[str]) -> str:
+    value = match.group(0)
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return "[链接]"
+    if not parts.query:
+        return value
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
 def _row_to_device(row: sqlite3.Row) -> Device:
@@ -400,6 +551,7 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         device_id=row["device_id"],
         source_url=row["source_url"],
         normalized_url=row["normalized_url"],
+        job_type=JobType(row["job_type"]),
         provider=row["provider"],
         status=JobStatus(row["status"]),
         progress=row["progress"],
@@ -421,6 +573,17 @@ def _row_to_job(row: sqlite3.Row) -> Job:
     )
 
 
+def _row_to_job_event(row: sqlite3.Row) -> JobEvent:
+    return JobEvent(
+        id=row["id"],
+        job_id=row["job_id"],
+        level=row["level"],
+        event_type=row["event_type"],
+        message=row["message"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
 def _row_to_artifact(row: sqlite3.Row) -> Artifact:
     return Artifact(
         id=row["id"],
@@ -428,6 +591,15 @@ def _row_to_artifact(row: sqlite3.Row) -> Artifact:
         file_name=row["file_name"],
         mime_type=row["mime_type"],
         storage_path=row["storage_path"],
+        thumbnail_path=row["thumbnail_path"],
+        role=ArtifactRole(row["role"]),
         file_size=row["file_size"],
+        duration_seconds=row["duration_seconds"],
+        width=row["width"],
+        height=row["height"],
+        video_codec=row["video_codec"],
+        audio_codec=row["audio_codec"],
+        bitrate_kbps=row["bitrate_kbps"],
+        container_format=row["container_format"],
         created_at=datetime.fromisoformat(row["created_at"]),
     )

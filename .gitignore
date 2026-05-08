@@ -7,8 +7,11 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.xcuserdata/
+xcuserdata/
 *.xcuserstate
 cookies*.txt
+/build/
+/dist/
 client/.build/
 client/.deriveddata/
 client/.swiftpm/

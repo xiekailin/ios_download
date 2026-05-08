@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from app.core.config import Settings
-from app.core.errors import AuthenticationError, TooManyRequestsAppError
+from app.core.errors import AuthenticationError, AuthorizationError, TooManyRequestsAppError
 from app.core.security import generate_token, hash_token
 from app.domain.models import Device
 from app.schemas.devices import RegisterDeviceRequest
@@ -41,6 +41,10 @@ class DeviceService:
 
     def register(self, payload: RegisterDeviceRequest, *, client_key: str) -> tuple[Device, str]:
         self._register_limiter.check(client_key)
+        if self._settings.cloud_mode and (
+            not self._settings.bootstrap_code or payload.bootstrap_code != self._settings.bootstrap_code
+        ):
+            raise AuthorizationError("invalid bootstrap code")
         token = generate_token()
         device = self._repository.create(
             name=payload.device_name,

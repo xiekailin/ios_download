@@ -5,6 +5,8 @@ from fastapi.responses import FileResponse
 
 from app.api.deps import AppContainer, get_container, get_current_device
 from app.domain.models import Device
+from app.schemas.artifacts import DeleteArtifactResponse
+from app.schemas.responses import DataResponse
 
 router = APIRouter(prefix="/artifacts", tags=["artifacts"])
 
@@ -17,3 +19,13 @@ def download_artifact(
 ) -> FileResponse:
     file_name, file_path, mime_type = app_container.artifact_service.get_owned_artifact_path(artifact_id, device)
     return FileResponse(path=file_path, media_type=mime_type, filename=file_name)
+
+
+@router.delete("/{artifact_id}", response_model=DataResponse[DeleteArtifactResponse])
+def delete_artifact(
+    artifact_id: str,
+    device: Device = Depends(get_current_device),
+    app_container: AppContainer = Depends(get_container),
+) -> dict[str, DeleteArtifactResponse]:
+    deleted = app_container.job_service.delete_artifact(artifact_id, device)
+    return {"data": DeleteArtifactResponse(deleted=deleted)}

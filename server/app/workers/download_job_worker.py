@@ -2,19 +2,23 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+import json
 import logging
 import mimetypes
 import os
+import math
 import re
 import shutil
 import signal
 import subprocess
 import threading
+from subprocess import run as subprocess_run
 import time
 
 from app.core.config import Settings
 from app.core.errors import DownloadAppError, ProviderAppError
-from app.domain.models import DeliveryMode, JobStatus
+from app.core.ytdlp_errors import is_ytdlp_login_required, ytdlp_safe_error_text, ytdlp_user_message
+from app.domain.models import DeliveryMode, JobStatus, JobType
 from app.extractors.selector import ProviderSelector
 from app.services.media_downloader import MediaDownloader
 from app.services.repositories import ArtifactRepository, JobRepository
@@ -29,9 +33,44 @@ _YTDLP_ETA_RE = re.compile(r"ETA\s+(?P<eta>[0-9:]+)")
 _YTDLP_DOWNLOADED_RE = re.compile(r"^\[download\]\s+(?P<size>[0-9.]+(?:[KMGTPE]?i?B|B))(?=\s+at|\s*$)")
 _ARTIFACT_INVALID_CHARS_RE = re.compile(r"[\x00-\x1f\\/:*?\"<>|]+")
 _ARTIFACT_WHITESPACE_RE = re.compile(r"\s+")
-_YOUTUBE_MP4_FORMAT_SELECTOR = "bestvideo*[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo*+bestaudio/best"
+_BEST_MP4_FORMAT_SELECTOR = "bestvideo*[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo*+bestaudio/best"
+_ALLOWED_ARTIFACT_EXTENSIONS = frozenset({"mp4", "mov", "webm", "m4a", "mp3", "jpg", "jpeg", "png", "webp", "gif"})
 _PROGRESS_UPDATE_INTERVAL_SECONDS = 0.5
 _MAX_DELEGATE_STDERR_LINES = 200
+_DELEGATE_DOWNLOAD_RETRY_COUNT = 3
+_DELEGATE_RETRYABLE_ERROR_MARKERS = (
+    "timed out",
+    "timeout",
+    "http error 429",
+    "http error 500",
+    "http error 502",
+    "http error 503",
+    "http error 504",
+    "service unavailable",
+    "too many requests",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "remote end closed connection",
+    "temporary failure",
+    "temporarily unavailable",
+    "network is unreachable",
+)
+_DELEGATE_NON_RETRYABLE_ERROR_MARKERS = (
+    "canceled",
+    "cancelled",
+    "binary not found",
+    "exceeds size limit",
+    "login verification required",
+    "requested format",
+    "format is not available",
+    "no video formats",
+    "no artifact",
+    "private",
+    "has been removed",
+    "not available",
+    "video unavailable",
+)
 
 
 class DownloadJobWorker:
@@ -56,21 +95,23 @@ class DownloadJobWorker:
             return
 
         artifact_path: Path | None = None
+        thumbnail_path: Path | None = None
         artifact_id: str | None = None
         delegate_output_prefix: str | None = None
         try:
-            if not self._jobs.transition_status(
+            if not self._transition_status_with_event(
                 job_id,
                 from_statuses={JobStatus.QUEUED},
                 to_status=JobStatus.RESOLVING,
                 progress=5,
+                message="开始解析链接",
             ):
                 return
             job = self._jobs.get(job_id)
             if job is None:
                 return
             extracted = self._selector.extract(normalize_extraction_source_url(job.source_url))
-            if not self._jobs.transition_status(
+            if not self._transition_status_with_event(
                 job_id,
                 from_statuses={JobStatus.RESOLVING},
                 to_status=JobStatus.RESOLVED,
@@ -79,9 +120,10 @@ class DownloadJobWorker:
                 media_title=extracted.title,
                 author_handle=extracted.author_handle,
                 thumbnail_url=extracted.thumbnail_url,
+                message="链接解析完成",
             ):
                 return
-            if not self._jobs.transition_status(
+            if not self._transition_status_with_event(
                 job_id,
                 from_statuses={JobStatus.RESOLVED},
                 to_status=JobStatus.DOWNLOADING,
@@ -91,8 +133,11 @@ class DownloadJobWorker:
                 total_bytes=None,
                 speed_bytes_per_sec=None,
                 eta_seconds=None,
+                message="开始下载素材",
             ):
                 return
+            if job.job_type == JobType.AUDIO_DOWNLOAD and extracted.delivery_mode != DeliveryMode.DELEGATE_YTDLP and extracted.file_extension.lower() in {"jpg", "jpeg", "png", "webp", "gif"}:
+                raise DownloadAppError("no extractable audio found", "该链接没有可提取的音频。")
             if extracted.delivery_mode == DeliveryMode.DELEGATE_YTDLP:
                 delegate_output_prefix = job_id
                 artifact_path = self._download_via_ytdlp(
@@ -100,6 +145,7 @@ class DownloadJobWorker:
                     title=extracted.title,
                     source_url=normalize_extraction_source_url(job.source_url),
                     ext=extracted.file_extension,
+                    audio_only=job.job_type == JobType.AUDIO_DOWNLOAD,
                 )
             else:
                 artifact_path = self._download_media(
@@ -109,8 +155,10 @@ class DownloadJobWorker:
                     allowed_addresses=extracted.direct_url_addresses,
                     ext=extracted.file_extension,
                 )
+                if job.job_type == JobType.AUDIO_DOWNLOAD:
+                    artifact_path = self._extract_mp3(job_id=job_id, title=extracted.title, source_path=artifact_path)
             current = self._jobs.get(job_id)
-            if not self._jobs.transition_status(
+            if not self._transition_status_with_event(
                 job_id,
                 from_statuses={JobStatus.DOWNLOADING},
                 to_status=JobStatus.STORING,
@@ -120,19 +168,26 @@ class DownloadJobWorker:
                 total_bytes=current.total_bytes if current else None,
                 speed_bytes_per_sec=current.speed_bytes_per_sec if current else None,
                 eta_seconds=current.eta_seconds if current else None,
+                message="正在保存文件",
             ):
                 self._cleanup_file(artifact_path)
                 return
+            media_details = self._probe_media_details(artifact_path)
+            mime_type = mimetypes.guess_type(artifact_path.name)[0] or "application/octet-stream"
+            if self._should_generate_thumbnail(job.job_type, mime_type, media_details):
+                thumbnail_path = self._generate_video_thumbnail(job_id, artifact_path, media_details.get("duration_seconds"))
             artifact = self._artifacts.create(
                 job_id=job_id,
                 file_name=artifact_path.name,
-                mime_type=mimetypes.guess_type(artifact_path.name)[0] or "application/octet-stream",
+                mime_type=mime_type,
                 storage_path=str(artifact_path),
                 file_size=artifact_path.stat().st_size,
+                thumbnail_path=str(thumbnail_path) if thumbnail_path else None,
+                **media_details,
             )
             artifact_id = artifact.id
             completed_size = artifact.file_size
-            if not self._jobs.transition_status(
+            if not self._transition_status_with_event(
                 job_id,
                 from_statuses={JobStatus.STORING},
                 to_status=JobStatus.COMPLETED,
@@ -144,13 +199,18 @@ class DownloadJobWorker:
                 eta_seconds=None,
                 artifact_id=artifact.id,
                 finished_at=datetime.now(tz=UTC),
+                message="素材已保存",
             ):
                 self._artifacts.delete(artifact.id)
+                if thumbnail_path is not None:
+                    self._cleanup_file(thumbnail_path)
                 self._cleanup_file(artifact_path)
         except (ProviderAppError, DownloadAppError) as exc:
             self._mark_failed(job_id, error_code=exc.code, error_message=exc.message, user_message=exc.user_message)
             if artifact_id is not None:
                 self._artifacts.delete(artifact_id)
+            if thumbnail_path is not None:
+                self._cleanup_file(thumbnail_path)
             if artifact_path is not None:
                 self._cleanup_file(artifact_path)
             if delegate_output_prefix is not None:
@@ -165,19 +225,28 @@ class DownloadJobWorker:
             )
             if artifact_id is not None:
                 self._artifacts.delete(artifact_id)
+            if thumbnail_path is not None:
+                self._cleanup_file(thumbnail_path)
             if artifact_path is not None:
                 self._cleanup_file(artifact_path)
             if delegate_output_prefix is not None:
                 self._cleanup_delegate_outputs(delegate_output_prefix)
 
+    def _transition_status_with_event(self, job_id: str, *, message: str, **kwargs) -> bool:
+        changed = self._jobs.transition_status(job_id, **kwargs)
+        if changed:
+            self._jobs.create_event(job_id, level="info", event_type=kwargs["to_status"].value, message=message)
+        return changed
+
     def _mark_failed(self, job_id: str, *, error_code: str, error_message: str, user_message: str) -> None:
         current = self._jobs.get(job_id)
         if current is None or current.status == JobStatus.CANCELED:
             return
+        self._jobs.create_event(job_id, level="error", event_type="failed", message=user_message)
         self._jobs.update_status(
             job_id,
             status=JobStatus.FAILED,
-            progress=100,
+            progress=current.progress,
             downloaded_bytes=current.downloaded_bytes,
             total_bytes=current.total_bytes,
             speed_bytes_per_sec=current.speed_bytes_per_sec,
@@ -205,6 +274,7 @@ class DownloadJobWorker:
         output_path = self._allocate_artifact_path(
             stem=self._safe_artifact_stem(title, fallback=job_id),
             ext=ext,
+            directory=self._artifact_output_dir(JobType.DOWNLOAD),
         )
         temp_path = output_path.with_suffix(output_path.suffix + ".part")
         last_reported_at = 0.0
@@ -254,10 +324,78 @@ class DownloadJobWorker:
             self._cleanup_file(output_path)
             raise
 
-    def _download_via_ytdlp(self, *, job_id: str, title: str | None, source_url: str, ext: str) -> Path:
+    def _download_via_ytdlp(self, *, job_id: str, title: str | None, source_url: str, ext: str, audio_only: bool = False) -> Path:
         output_template = self._settings.artifacts_dir / f"{job_id}.%(ext)s"
         ffmpeg_location = self._resolve_ffmpeg_location()
-        command = [
+        command = self._delegate_download_command(
+            source_url=source_url,
+            output_template=output_template,
+            ffmpeg_location=ffmpeg_location,
+            ext=ext,
+            audio_only=audio_only,
+        )
+        self._run_delegate_download_with_retries(job_id=job_id, command=command, source_url=source_url)
+
+        artifact_path = self._find_delegate_output(job_id)
+        if artifact_path is None:
+            raise DownloadAppError("yt-dlp delegated download produced no artifact")
+        if artifact_path.stat().st_size > self._settings.download_max_bytes:
+            self._cleanup_file(artifact_path)
+            raise DownloadAppError("delegated download exceeds size limit")
+        return self._finalize_delegate_artifact(artifact_path, title=title, fallback=job_id)
+
+    def _run_delegate_download_with_retries(self, *, job_id: str, command: list[str], source_url: str) -> None:
+        for attempt in range(_DELEGATE_DOWNLOAD_RETRY_COUNT + 1):
+            self._raise_if_job_canceled(job_id)
+            if attempt > 0:
+                self._cleanup_delegate_outputs(job_id)
+            try:
+                self._run_delegate_download_once(job_id=job_id, command=command, source_url=source_url)
+                return
+            except DownloadAppError as exc:
+                self._raise_if_job_canceled(job_id)
+                if attempt == _DELEGATE_DOWNLOAD_RETRY_COUNT or not self._is_retryable_delegate_download_error(exc):
+                    raise
+
+    def _raise_if_job_canceled(self, job_id: str) -> None:
+        current = self._jobs.get(job_id)
+        if current is None or current.status == JobStatus.CANCELED:
+            raise DownloadAppError("yt-dlp download canceled", "任务已取消。")
+
+    def _run_delegate_download_once(self, *, job_id: str, command: list[str], source_url: str) -> None:
+        retry_command = self._settings.youtube_cookie_retry_command(command, source_url)
+        try:
+            self._run_delegate_download(job_id=job_id, command=command)
+        except DownloadAppError as exc:
+            if not retry_command or not is_ytdlp_login_required(exc.message):
+                raise
+            self._cleanup_delegate_outputs(job_id)
+            try:
+                self._run_delegate_download(job_id=job_id, command=retry_command)
+            except DownloadAppError as retry_exc:
+                if is_ytdlp_login_required(retry_exc.message):
+                    raise DownloadAppError(
+                        ytdlp_safe_error_text(retry_exc.message),
+                        ytdlp_user_message(retry_exc.message, retried_with_cookie=True),
+                    ) from retry_exc
+                raise
+
+    def _is_retryable_delegate_download_error(self, exc: DownloadAppError) -> bool:
+        message = exc.message.lower()
+        if any(marker in message for marker in _DELEGATE_NON_RETRYABLE_ERROR_MARKERS):
+            return False
+        return any(marker in message for marker in _DELEGATE_RETRYABLE_ERROR_MARKERS)
+
+    def _delegate_download_command(
+        self,
+        *,
+        source_url: str,
+        output_template: Path,
+        ffmpeg_location: str,
+        ext: str,
+        audio_only: bool,
+    ) -> list[str]:
+        return [
             *self._settings.yt_dlp_command,
             "--ignore-config",
             "--no-warnings",
@@ -266,7 +404,7 @@ class DownloadJobWorker:
             *self._settings.youtube_runtime_args(source_url),
             "--max-filesize",
             str(self._settings.download_max_bytes),
-            *self._delegate_format_args(source_url=source_url, ext=ext),
+            *self._delegate_format_args(source_url=source_url, ext=ext, audio_only=audio_only),
             "--ffmpeg-location",
             ffmpeg_location,
             "-o",
@@ -274,6 +412,8 @@ class DownloadJobWorker:
             "--",
             source_url,
         ]
+
+    def _run_delegate_download(self, *, job_id: str, command: list[str]) -> None:
         try:
             process = subprocess.Popen(
                 command,
@@ -287,13 +427,15 @@ class DownloadJobWorker:
             raise DownloadAppError("yt-dlp binary not found", "当前下载器暂时不可用。") from exc
 
         output_lines: list[str] = []
+        state_lock = threading.Lock()
+        last_progress_at: float | None = None
         last_reported_at = 0.0
         last_reported_progress: int | None = None
         last_reported_bytes: int | None = None
         reader_error: Exception | None = None
 
         def consume_progress() -> None:
-            nonlocal last_reported_at, last_reported_progress, last_reported_bytes, reader_error
+            nonlocal last_progress_at, last_reported_at, last_reported_progress, last_reported_bytes, reader_error
             stdout_stream = getattr(process, "stdout", None)
             stderr_stream = getattr(process, "stderr", None)
             stream = stdout_stream if stdout_stream is not None else stderr_stream
@@ -304,12 +446,15 @@ class DownloadJobWorker:
                     line = raw_line.strip()
                     if not line:
                         continue
-                    output_lines.append(line)
-                    if len(output_lines) > _MAX_DELEGATE_STDERR_LINES:
-                        del output_lines[:-_MAX_DELEGATE_STDERR_LINES]
+                    with state_lock:
+                        output_lines.append(line)
+                        if len(output_lines) > _MAX_DELEGATE_STDERR_LINES:
+                            del output_lines[:-_MAX_DELEGATE_STDERR_LINES]
                     parsed = self._parse_ytdlp_progress(line)
                     if parsed is None:
                         continue
+                    with state_lock:
+                        last_progress_at = time.monotonic()
                     downloaded_bytes, total_bytes, speed_bytes_per_sec, eta_seconds, progress = parsed
                     force = total_bytes is not None and downloaded_bytes is not None and downloaded_bytes >= total_bytes
                     now = time.monotonic()
@@ -329,16 +474,28 @@ class DownloadJobWorker:
                     last_reported_progress = progress
                     last_reported_bytes = downloaded_bytes
             except Exception as exc:  # pragma: no cover - defensive guard around parser thread
-                reader_error = exc
+                with state_lock:
+                    reader_error = exc
 
         reader = threading.Thread(target=consume_progress, name=f"yt-dlp-progress-{job_id}", daemon=True)
         reader.start()
         try:
-            return_code = process.wait(timeout=self._settings.provider_timeout_seconds)
-        except subprocess.TimeoutExpired as exc:
-            self._terminate_delegate_process(process)
-            reader.join(timeout=1)
-            raise DownloadAppError("yt-dlp download timed out") from exc
+            while True:
+                try:
+                    return_code = process.wait(timeout=self._settings.provider_timeout_seconds)
+                    break
+                except subprocess.TimeoutExpired as exc:
+                    current = self._jobs.get(job_id)
+                    if current is None or current.status == JobStatus.CANCELED:
+                        self._terminate_delegate_process(process)
+                        raise DownloadAppError("yt-dlp download canceled", "任务已取消。") from exc
+                    with state_lock:
+                        progress_at = last_progress_at
+                    if progress_at is not None and time.monotonic() - progress_at < self._settings.provider_timeout_seconds:
+                        continue
+                    self._terminate_delegate_process(process)
+                    reader.join(timeout=1)
+                    raise DownloadAppError("yt-dlp download timed out", "下载长时间没有进展，请稍后重试。") from exc
         finally:
             reader.join(timeout=1)
             stdout_stream = getattr(process, "stdout", None)
@@ -348,18 +505,47 @@ class DownloadJobWorker:
             if stderr_stream is not None:
                 stderr_stream.close()
 
-        if reader_error is not None:
-            raise DownloadAppError("yt-dlp progress parsing failed") from reader_error
+        with state_lock:
+            captured_reader_error = reader_error
+            captured_output_lines = list(output_lines)
+        if captured_reader_error is not None:
+            raise DownloadAppError("yt-dlp progress parsing failed") from captured_reader_error
         if return_code != 0:
-            raise DownloadAppError(self._delegate_error_message(output_lines) or "yt-dlp delegated download failed")
+            error_text = self._delegate_error_message(captured_output_lines) or "yt-dlp delegated download failed"
+            raise DownloadAppError(ytdlp_safe_error_text(error_text), ytdlp_user_message(error_text))
 
-        artifact_path = self._find_delegate_output(job_id)
-        if artifact_path is None:
-            raise DownloadAppError("yt-dlp delegated download produced no artifact")
-        if artifact_path.stat().st_size > self._settings.download_max_bytes:
-            self._cleanup_file(artifact_path)
-            raise DownloadAppError("delegated download exceeds size limit")
-        return self._finalize_delegate_artifact(artifact_path, title=title, fallback=job_id)
+    def _extract_mp3(self, *, job_id: str, title: str | None, source_path: Path) -> Path:
+        output_path = self._artifact_output_dir(JobType.AUDIO_DOWNLOAD) / f"{job_id}.audio.mp3"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        command = [
+            self._settings.ffmpeg_binary,
+            "-i",
+            str(source_path),
+            "-vn",
+            "-codec:a",
+            "libmp3lame",
+            "-q:a",
+            "2",
+            "-y",
+            str(output_path),
+        ]
+        try:
+            subprocess.run(command, capture_output=True, text=True, check=True, timeout=self._settings.provider_timeout_seconds)
+            if output_path.stat().st_size > self._settings.download_max_bytes:
+                self._cleanup_file(output_path)
+                raise DownloadAppError("extracted mp3 exceeds size limit")
+            return self._finalize_delegate_artifact(output_path, title=title, fallback=job_id)
+        except FileNotFoundError as exc:
+            self._cleanup_file(output_path)
+            raise DownloadAppError("ffmpeg binary not found", "当前音频转换器暂时不可用。") from exc
+        except subprocess.TimeoutExpired as exc:
+            self._cleanup_file(output_path)
+            raise DownloadAppError("mp3 extraction timed out", "转换 MP3 超时。") from exc
+        except subprocess.CalledProcessError as exc:
+            self._cleanup_file(output_path)
+            raise DownloadAppError("mp3 extraction failed", "转换 MP3 失败。") from exc
+        finally:
+            self._cleanup_file(source_path)
 
     def _update_download_progress(
         self,
@@ -375,11 +561,19 @@ class DownloadJobWorker:
         normalized_downloaded = downloaded_bytes if downloaded_bytes is not None and downloaded_bytes >= 0 else None
         if normalized_downloaded is not None and normalized_total is not None:
             normalized_downloaded = min(normalized_downloaded, normalized_total)
+        current = self._jobs.get(job_id)
+        if current is not None:
+            if current.downloaded_bytes is not None:
+                normalized_downloaded = max(normalized_downloaded or 0, current.downloaded_bytes)
+            if normalized_total is None:
+                normalized_total = current.total_bytes
+            elif current.total_bytes is not None:
+                normalized_total = max(normalized_total, current.total_bytes)
         self._jobs.transition_status(
             job_id,
             from_statuses={JobStatus.DOWNLOADING},
             to_status=JobStatus.DOWNLOADING,
-            progress=progress,
+            progress=max(progress, current.progress if current else 0),
             downloaded_bytes=normalized_downloaded,
             total_bytes=normalized_total,
             speed_bytes_per_sec=speed_bytes_per_sec,
@@ -388,7 +582,11 @@ class DownloadJobWorker:
 
     def _progress_from_bytes(self, downloaded_bytes: int, total_bytes: int | None) -> int:
         if total_bytes is None or total_bytes <= 0:
-            return 45
+            bounded_downloaded_bytes = max(downloaded_bytes, 0)
+            if bounded_downloaded_bytes == 0:
+                return 45
+            progress_delta = int(math.log2((bounded_downloaded_bytes / (256 * 1024)) + 1) * 4)
+            return min(89, 45 + progress_delta)
         bounded_downloaded_bytes = min(max(downloaded_bytes, 0), total_bytes)
         percent = (bounded_downloaded_bytes / total_bytes) * 100
         return self._progress_from_percent(percent)
@@ -428,7 +626,7 @@ class DownloadJobWorker:
             None,
             self._parse_human_speed(line),
             self._parse_eta_seconds(line),
-            45,
+            self._progress_from_bytes(downloaded_bytes, None),
         )
 
     def _parse_human_speed(self, line: str) -> int | None:
@@ -471,6 +669,99 @@ class DownloadJobWorker:
         }
         return int(number * multipliers[unit])
 
+    def _should_generate_thumbnail(self, job_type: JobType, mime_type: str, media_details: dict[str, float | int | str | None]) -> bool:
+        return job_type == JobType.DOWNLOAD and media_details.get("video_codec") is not None
+
+    def _generate_video_thumbnail(self, job_id: str, artifact_path: Path, duration_seconds: object) -> Path | None:
+        thumbnail_path = self._safe_child_dir("Thumbnails") / f"{job_id}.thumbnail.jpg"
+        seek_seconds = 1.0
+        if isinstance(duration_seconds, int | float) and duration_seconds > 0:
+            seek_seconds = min(max(float(duration_seconds) * 0.1, 1.0), 10.0)
+        command = [
+            self._settings.ffmpeg_binary,
+            "-ss",
+            f"{seek_seconds:.2f}",
+            "-i",
+            str(artifact_path),
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale='min(640,iw)':-1",
+            "-q:v",
+            "3",
+            "-y",
+            str(thumbnail_path),
+        ]
+        try:
+            subprocess.run(command, capture_output=True, text=True, check=True, timeout=30)
+            return thumbnail_path if thumbnail_path.exists() else None
+        except Exception:
+            logger.debug("thumbnail generation failed for artifact path=%s", artifact_path, exc_info=True)
+            self._cleanup_file(thumbnail_path)
+            return None
+
+    def _probe_media_details(self, artifact_path: Path) -> dict[str, float | int | str | None]:
+        command = [
+            self._ffprobe_binary(),
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            str(artifact_path),
+        ]
+        try:
+            result = subprocess_run(command, capture_output=True, check=True, timeout=30)
+            payload = json.loads(result.stdout.decode("utf-8"))
+        except Exception:
+            logger.debug("ffprobe failed for artifact path=%s", artifact_path, exc_info=True)
+            return {}
+        return self._media_details_from_probe(payload)
+
+    def _media_details_from_probe(self, payload: dict) -> dict[str, float | int | str | None]:
+        streams = payload.get("streams") if isinstance(payload.get("streams"), list) else []
+        format_data = payload.get("format") if isinstance(payload.get("format"), dict) else {}
+        video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), {})
+        audio_stream = next((stream for stream in streams if stream.get("codec_type") == "audio"), {})
+        return {
+            "duration_seconds": self._parse_optional_float(format_data.get("duration")),
+            "width": self._parse_optional_int(video_stream.get("width")),
+            "height": self._parse_optional_int(video_stream.get("height")),
+            "video_codec": video_stream.get("codec_name") if isinstance(video_stream.get("codec_name"), str) else None,
+            "audio_codec": audio_stream.get("codec_name") if isinstance(audio_stream.get("codec_name"), str) else None,
+            "bitrate_kbps": self._bitrate_kbps(format_data.get("bit_rate")),
+            "container_format": format_data.get("format_name") if isinstance(format_data.get("format_name"), str) else None,
+        }
+
+    def _ffprobe_binary(self) -> str:
+        ffmpeg_path = Path(self._settings.ffmpeg_binary)
+        if ffmpeg_path.name == "ffmpeg":
+            return str(ffmpeg_path.with_name("ffprobe"))
+        return "ffprobe"
+
+    def _bitrate_kbps(self, value: object) -> int | None:
+        bitrate = self._parse_optional_int(value)
+        if bitrate is None:
+            return None
+        return max(1, bitrate // 1000)
+
+    def _parse_optional_float(self, value: object) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_optional_int(self, value: object) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
     def _delegate_error_message(self, lines: list[str]) -> str:
         for line in reversed(lines):
             if line.startswith("ERROR:"):
@@ -495,12 +786,18 @@ class DownloadJobWorker:
         for match in matches:
             if match.name.endswith(".part") or not match.is_file():
                 continue
+            ext = match.suffix.lstrip(".").lower()
+            if ext not in _ALLOWED_ARTIFACT_EXTENSIONS:
+                self._cleanup_file(match)
+                raise DownloadAppError("delegated download produced unsupported file type")
             return match
         return None
 
-    def _delegate_format_args(self, *, source_url: str, ext: str) -> list[str]:
-        if detect_source_platform(source_url) == "youtube":
-            return ["-f", _YOUTUBE_MP4_FORMAT_SELECTOR, "--merge-output-format", "mp4"]
+    def _delegate_format_args(self, *, source_url: str, ext: str, audio_only: bool = False) -> list[str]:
+        if audio_only:
+            return ["-f", "bestaudio/best", "-x", "--audio-format", "mp3"]
+        if detect_source_platform(source_url) in {"x", "youtube"}:
+            return ["-f", _BEST_MP4_FORMAT_SELECTOR, "--merge-output-format", "mp4"]
         return ["--merge-output-format", self._normalize_extension(ext)]
 
     def _safe_artifact_stem(self, title: str | None, *, fallback: str) -> str:
@@ -510,12 +807,33 @@ class DownloadJobWorker:
             return fallback
         return cleaned[:120].rstrip(" .") or fallback
 
-    def _allocate_artifact_path(self, *, stem: str, ext: str) -> Path:
+    def _safe_child_dir(self, *parts: str) -> Path:
+        root = self._settings.artifacts_dir.resolve()
+        directory = self._settings.artifacts_dir.joinpath(*parts)
+        directory.mkdir(parents=True, exist_ok=True)
+        resolved = directory.resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise DownloadAppError("artifact output directory is unsafe", "文件目录配置异常。") from exc
+        return resolved
+
+    def _artifact_output_dir(self, job_type: JobType) -> Path:
+        return self._safe_child_dir("Audio" if job_type == JobType.AUDIO_DOWNLOAD else "Videos")
+
+    def _delegate_artifact_output_dir(self, ext: str) -> Path:
         normalized_ext = self._normalize_extension(ext)
+        audio_extensions = {"mp3", "m4a", "aac", "flac", "wav"}
+        return self._safe_child_dir("Audio" if normalized_ext in audio_extensions else "Videos")
+
+    def _allocate_artifact_path(self, *, stem: str, ext: str, directory: Path | None = None) -> Path:
+        normalized_ext = self._normalize_extension(ext)
+        output_dir = directory or self._settings.artifacts_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
         index = 0
         while True:
             suffix = "" if index == 0 else f" ({index})"
-            candidate = self._settings.artifacts_dir / f"{stem}{suffix}.{normalized_ext}"
+            candidate = output_dir / f"{stem}{suffix}.{normalized_ext}"
             try:
                 candidate.touch(exist_ok=False)
                 return candidate
@@ -525,9 +843,10 @@ class DownloadJobWorker:
     def _finalize_delegate_artifact(self, path: Path, *, title: str | None, fallback: str) -> Path:
         ext = path.suffix.lstrip(".") or "mp4"
         stem = self._safe_artifact_stem(title, fallback=fallback)
-        if path.parent == self._settings.artifacts_dir and path.stem == stem and self._normalize_extension(ext) == ext:
+        output_dir = self._delegate_artifact_output_dir(ext)
+        if path.parent == output_dir and path.stem == stem and self._normalize_extension(ext) == ext:
             return path
-        final_path = self._allocate_artifact_path(stem=stem, ext=ext)
+        final_path = self._allocate_artifact_path(stem=stem, ext=ext, directory=output_dir)
         try:
             final_path.unlink()
             shutil.move(str(path), str(final_path))
@@ -550,15 +869,20 @@ class DownloadJobWorker:
 
     def _normalize_extension(self, ext: str) -> str:
         cleaned = ext.split("?", maxsplit=1)[0].strip().strip(".").lower()
-        if not re.fullmatch(r"[a-z0-9]{1,10}", cleaned):
+        if not re.fullmatch(r"[a-z0-9]{1,10}", cleaned) or cleaned not in _ALLOWED_ARTIFACT_EXTENSIONS:
             return "mp4"
         return cleaned
 
     def _cleanup_file(self, path: Path) -> None:
-        if path.exists():
-            path.unlink()
+        artifacts_root = self._settings.artifacts_dir.resolve()
+        try:
+            resolved_path = path.resolve()
+            resolved_path.relative_to(artifacts_root)
+        except ValueError:
+            return
+        if resolved_path.exists() and resolved_path.is_file():
+            resolved_path.unlink()
 
     def _cleanup_delegate_outputs(self, job_id: str) -> None:
         for path in self._settings.artifacts_dir.glob(f"{job_id}.*"):
-            if path.is_file():
-                path.unlink()
+            self._cleanup_file(path)

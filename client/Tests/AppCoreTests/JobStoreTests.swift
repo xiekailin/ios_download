@@ -25,6 +25,33 @@ private func makeJob(id: String, sourceURL: String = "https://x.com/demo/status/
     )
 }
 
+@Test func jobStoreTracksBackendHealthStatus() async throws {
+    let store = await MainActor.run { JobStore() }
+    await MainActor.run {
+        #expect(store.backendHealthStatus == .unknown)
+        store.setBackendHealthStatus(.healthy)
+        #expect(store.backendHealthStatus == .healthy)
+        store.setBackendHealthStatus(.unhealthy)
+        #expect(store.backendHealthStatus == .unhealthy)
+    }
+}
+
+@Test func jobStoreClearsSingleAndBatchDraftsIndependently() async throws {
+    let store = await MainActor.run { JobStore() }
+    await MainActor.run {
+        #expect(store.batchDraftText.isEmpty)
+        store.draftURL = "https://x.com/demo/status/1"
+        store.batchDraftText = "https://x.com/demo/status/2"
+        store.clearDraftURL()
+        #expect(store.draftURL.isEmpty)
+        #expect(store.batchDraftText == "https://x.com/demo/status/2")
+        store.draftURL = "https://x.com/demo/status/3"
+        store.clearBatchDraftText()
+        #expect(store.draftURL == "https://x.com/demo/status/3")
+        #expect(store.batchDraftText.isEmpty)
+    }
+}
+
 @Test func jobStoreUpsertReplacesExistingJob() async throws {
     let store = await MainActor.run { JobStore() }
     let now = Date()
@@ -63,6 +90,26 @@ private func makeJob(id: String, sourceURL: String = "https://x.com/demo/status/
         #expect(store.jobs[0].totalBytes == 2048)
         #expect(store.jobs[0].speedBytesPerSec == 512)
         #expect(store.jobs[0].etaSeconds == 2)
+    }
+}
+
+@Test func jobStoreReplacePreservesActiveLocalJobsMissingFromRemoteRefresh() async throws {
+    let store = await MainActor.run { JobStore() }
+    let now = Date()
+    await MainActor.run {
+        store.upsert(makeJob(id: "local-job", now: now.addingTimeInterval(-60)), now: now)
+        store.replaceJobsPreservingActiveLocalJobs([makeJob(id: "remote-job", now: now.addingTimeInterval(1))], now: now.addingTimeInterval(1))
+        #expect(store.jobs.map(\.id) == ["remote-job", "local-job"])
+    }
+}
+
+@Test func jobStoreReplaceDropsStaleActiveLocalJobsMissingFromRemoteRefresh() async throws {
+    let store = await MainActor.run { JobStore() }
+    let now = Date()
+    await MainActor.run {
+        store.upsert(makeJob(id: "local-job", now: now), now: now.addingTimeInterval(-11))
+        store.replaceJobsPreservingActiveLocalJobs([], now: now)
+        #expect(store.jobs.isEmpty)
     }
 }
 

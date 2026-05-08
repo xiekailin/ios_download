@@ -21,5 +21,8 @@ let package = Package(
         .target(name: "SharedUI", dependencies: ["AppCore"]),
         .target(name: "PlatformAdapters", dependencies: ["AppCore"]),
         .testTarget(name: "AppCoreTests", dependencies: ["AppCore"]),
+        .testTarget(name: "NetworkingTests", dependencies: ["AppCore", "Networking"]),
+        .testTarget(name: "StorageTests", dependencies: ["AppCore", "Storage"]),
+        .testTarget(name: "PlatformAdaptersTests", dependencies: ["AppCore", "PlatformAdapters"]),
     ]
 )

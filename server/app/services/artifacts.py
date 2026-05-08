@@ -24,11 +24,20 @@ class ArtifactService:
         if job.device_id != device.id:
             raise AuthorizationError()
         file_path = Path(artifact.storage_path).resolve()
-        artifacts_root = self._settings.artifacts_dir.resolve()
-        try:
-            file_path.relative_to(artifacts_root)
-        except ValueError as exc:
-            raise NotFoundAppError("artifact file") from exc
+        allowed_roots = (
+            self._settings.artifacts_dir.resolve(),
+            (self._settings.database_path.parent / "Artifacts").resolve(),
+        )
+        if not any(_is_relative_to(file_path, root) for root in allowed_roots):
+            raise NotFoundAppError("artifact file")
         if not file_path.exists() or not file_path.is_file():
             raise NotFoundAppError("artifact file")
         return artifact.file_name, file_path, artifact.mime_type
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True

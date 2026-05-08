@@ -5,12 +5,13 @@ from dataclasses import dataclass
 from ipaddress import IPv4Address, IPv6Address, ip_address
 import re
 import socket
-from urllib.parse import ParseResult, parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import ParseResult, parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
 from app.core.errors import ProviderAppError, ValidationAppError
 
 IPAddress = IPv4Address | IPv6Address
 _YOUTUBE_VIDEO_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
+_INVALID_PERCENT_ENCODING_RE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +27,7 @@ class ResolvedDownloadURL:
 class SourcePlatformConfig:
     source_hosts: frozenset[str]
     download_hosts: frozenset[str]
+    download_host_suffixes: frozenset[str]
     path_matches: Callable[[str, str], bool]
 
 
@@ -33,11 +35,36 @@ def _matches_x_path(_: str, path: str) -> bool:
     return "/status/" in path
 
 
+def _matches_single_value_path(path: str, prefix: str) -> bool:
+    if not path.startswith(prefix):
+        return False
+    value = path.removeprefix(prefix)
+    if value.endswith("/"):
+        value = value[:-1]
+    for _ in range(8):
+        if not value or "/" in value or "\\" in value or _INVALID_PERCENT_ENCODING_RE.search(value):
+            return False
+        decoded_value = unquote(value)
+        if decoded_value == value:
+            return True
+        value = decoded_value
+    return False
+
+
 def _matches_douyin_path(host: str, path: str) -> bool:
-    normalized_path = path.rstrip("/")
     if host == "www.douyin.com":
-        return normalized_path.startswith("/video/")
-    return normalized_path not in {"", "/"}
+        return _matches_single_value_path(path, "/video/")
+    if host in {"m.douyin.com", "www.iesdouyin.com"}:
+        return _matches_single_value_path(path, "/share/video/")
+    return _matches_single_value_path(path, "/")
+
+
+def _matches_pipixia_path(host: str, path: str) -> bool:
+    if host == "h5.pipix.com":
+        return _matches_single_value_path(path, "/s/")
+    if host == "www.pipix.com":
+        return _matches_single_value_path(path, "/item/")
+    return False
 
 
 def _matches_xiaohongshu_path(host: str, path: str) -> bool:
@@ -82,12 +109,20 @@ _SOURCE_PLATFORMS: dict[str, SourcePlatformConfig] = {
     "x": SourcePlatformConfig(
         source_hosts=frozenset({"x.com", "www.x.com", "twitter.com", "www.twitter.com"}),
         download_hosts=frozenset({"video.twimg.com", "video-cf.twimg.com", "pbs.twimg.com"}),
+        download_host_suffixes=frozenset(),
         path_matches=_matches_x_path,
     ),
     "douyin": SourcePlatformConfig(
-        source_hosts=frozenset({"www.douyin.com", "v.douyin.com"}),
+        source_hosts=frozenset({"www.douyin.com", "m.douyin.com", "www.iesdouyin.com", "v.douyin.com"}),
         download_hosts=frozenset({"api-play-hl.amemv.com"}),
+        download_host_suffixes=frozenset({"douyinvod.com"}),
         path_matches=_matches_douyin_path,
+    ),
+    "pipixia": SourcePlatformConfig(
+        source_hosts=frozenset({"h5.pipix.com", "www.pipix.com"}),
+        download_hosts=frozenset(),
+        download_host_suffixes=frozenset(),
+        path_matches=_matches_pipixia_path,
     ),
     "xiaohongshu": SourcePlatformConfig(
         source_hosts=frozenset({"www.xiaohongshu.com", "xhslink.com", "www.xhslink.com"}),
@@ -95,25 +130,31 @@ _SOURCE_PLATFORMS: dict[str, SourcePlatformConfig] = {
             {
                 "sns-video-ak.xhscdn.com",
                 "sns-video-hw.xhscdn.com",
+                "sns-img-ak.xhscdn.com",
+                "sns-img-hw.xhscdn.com",
                 "sns-bak-v1.xhscdn.com",
                 "sns-bak-v6.xhscdn.com",
             }
         ),
+        download_host_suffixes=frozenset(),
         path_matches=_matches_xiaohongshu_path,
     ),
     "bilibili": SourcePlatformConfig(
         source_hosts=frozenset({"www.bilibili.com"}),
         download_hosts=frozenset(),
+        download_host_suffixes=frozenset(),
         path_matches=_matches_bilibili_path,
     ),
     "youtube": SourcePlatformConfig(
         source_hosts=frozenset({"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}),
         download_hosts=frozenset(),
+        download_host_suffixes=frozenset(),
         path_matches=_matches_youtube_path,
     ),
 }
 _SUPPORTED_SOURCE_HOSTS = frozenset(host for config in _SOURCE_PLATFORMS.values() for host in config.source_hosts)
 _ALL_ALLOWED_DOWNLOAD_HOSTS = frozenset(host for config in _SOURCE_PLATFORMS.values() for host in config.download_hosts)
+_ALL_ALLOWED_DOWNLOAD_HOST_SUFFIXES = frozenset(suffix for config in _SOURCE_PLATFORMS.values() for suffix in config.download_host_suffixes)
 
 
 def detect_source_platform(raw_url: str) -> str | None:
@@ -155,7 +196,7 @@ def _normalize_source_url(raw_url: str, *, for_extraction: bool) -> str:
     platform = _detect_source_platform_from_parsed(parsed)
     if platform is None:
         if normalized_host not in _SUPPORTED_SOURCE_HOSTS:
-            raise ValidationAppError("unsupported host", "目前只支持 X、抖音、小红书、Bilibili 和 YouTube 公开链接。")
+            raise ValidationAppError("unsupported host", "目前只支持 X、抖音、皮皮虾、小红书、Bilibili 和 YouTube 公开链接。")
         raise ValidationAppError("unsupported source URL", "请提供公开分享链接。")
 
     normalized_query = _normalize_source_query(parsed, platform=platform, for_extraction=for_extraction)
@@ -209,12 +250,20 @@ def allowed_download_hosts_for_source_url(raw_url: str) -> frozenset[str]:
     return _SOURCE_PLATFORMS[platform].download_hosts
 
 
+def allowed_download_host_suffixes_for_source_url(raw_url: str) -> frozenset[str]:
+    platform = detect_source_platform(raw_url)
+    if platform is None:
+        raise ProviderAppError("unsupported source URL")
+    return _SOURCE_PLATFORMS[platform].download_host_suffixes
+
+
 def resolve_download_url(
     raw_url: str,
     *,
     base_url: str | None = None,
     source_url: str | None = None,
     allowed_hosts: frozenset[str] | set[str] | None = None,
+    allowed_host_suffixes: frozenset[str] | set[str] | None = None,
 ) -> ResolvedDownloadURL:
     candidate_url = urljoin(base_url, raw_url.strip()) if base_url else raw_url.strip()
     _ensure_no_control_chars(candidate_url)
@@ -238,7 +287,19 @@ def resolve_download_url(
         base_url=base_url,
         allowed_hosts=allowed_hosts,
     )
-    if normalized_host not in active_allowed_hosts:
+    if allowed_hosts is not None and allowed_host_suffixes is None:
+        active_allowed_host_suffixes = frozenset()
+    else:
+        active_allowed_host_suffixes = _resolve_allowed_download_host_suffixes(
+            source_url=source_url,
+            base_url=base_url,
+            allowed_host_suffixes=allowed_host_suffixes,
+        )
+    if not _is_allowed_download_host(
+        normalized_host,
+        active_allowed_hosts,
+        active_allowed_host_suffixes,
+    ):
         raise ProviderAppError("download URL host is not allowed")
     if parsed.scheme == "http":
         if source_platform != "xiaohongshu":
@@ -303,9 +364,36 @@ def _resolve_allowed_download_hosts(
         return allowed_hosts
     if source_url is not None:
         return allowed_download_hosts_for_source_url(source_url)
+    if base_url is not None:
+        if is_supported_source_url(base_url):
+            return allowed_download_hosts_for_source_url(base_url)
+        base_host = urlparse(base_url).hostname
+        if base_host is not None and base_host.lower() in _ALL_ALLOWED_DOWNLOAD_HOSTS:
+            return frozenset({base_host.lower()})
+    return frozenset()
+
+
+def _resolve_allowed_download_host_suffixes(
+    *,
+    source_url: str | None,
+    base_url: str | None,
+    allowed_host_suffixes: frozenset[str] | set[str] | None,
+) -> frozenset[str] | set[str]:
+    if allowed_host_suffixes is not None:
+        return allowed_host_suffixes
+    if source_url is not None:
+        return allowed_download_host_suffixes_for_source_url(source_url)
     if base_url is not None and is_supported_source_url(base_url):
-        return allowed_download_hosts_for_source_url(base_url)
-    return _ALL_ALLOWED_DOWNLOAD_HOSTS
+        return allowed_download_host_suffixes_for_source_url(base_url)
+    return frozenset()
+
+
+def _is_allowed_download_host(
+    host: str,
+    allowed_hosts: frozenset[str] | set[str],
+    allowed_host_suffixes: frozenset[str] | set[str],
+) -> bool:
+    return host in allowed_hosts or any(host.endswith(f".{suffix}") for suffix in allowed_host_suffixes)
 
 
 def _ensure_no_control_chars(value: str) -> None:
