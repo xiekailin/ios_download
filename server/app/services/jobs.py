@@ -56,24 +56,37 @@ class BackgroundJobRunner:
     worker: object
     max_jobs: int
     enabled: bool = True
-    _executor: ThreadPoolExecutor = field(init=False)
+    download_max_jobs: int | None = None
+    audio_separation_max_jobs: int = 1
+    _download_executor: ThreadPoolExecutor = field(init=False)
+    _audio_separation_executor: ThreadPoolExecutor = field(init=False)
     _lock: threading.Lock = field(init=False)
     _running_job_ids: set[str] = field(init=False)
 
     def __post_init__(self) -> None:
-        self._executor = ThreadPoolExecutor(max_workers=max(1, self.max_jobs), thread_name_prefix="xdl-worker")
+        download_max_jobs = self.download_max_jobs if self.download_max_jobs is not None else self.max_jobs
+        self._download_executor = ThreadPoolExecutor(max_workers=max(1, download_max_jobs), thread_name_prefix="xdl-download")
+        self._audio_separation_executor = ThreadPoolExecutor(
+            max_workers=max(1, self.audio_separation_max_jobs),
+            thread_name_prefix="xdl-heavy",
+        )
         self._lock = threading.Lock()
         self._running_job_ids = set()
 
-    def dispatch(self, job_id: str) -> bool:
+    def dispatch(self, job_id: str, *, job_type: JobType = JobType.DOWNLOAD) -> bool:
         if not self.enabled:
             return False
         with self._lock:
             if job_id in self._running_job_ids:
                 return False
             self._running_job_ids.add(job_id)
-        self._executor.submit(self._run_job, job_id)
+        self._executor_for(job_type).submit(self._run_job, job_id)
         return True
+
+    def _executor_for(self, job_type: JobType) -> ThreadPoolExecutor:
+        if job_type == JobType.AUDIO_SEPARATION:
+            return self._audio_separation_executor
+        return self._download_executor
 
     def _run_job(self, job_id: str) -> None:
         try:
@@ -83,7 +96,8 @@ class BackgroundJobRunner:
                 self._running_job_ids.discard(job_id)
 
     def close(self, *, wait: bool = True) -> None:
-        self._executor.shutdown(wait=wait, cancel_futures=not wait)
+        self._download_executor.shutdown(wait=wait, cancel_futures=not wait)
+        self._audio_separation_executor.shutdown(wait=wait, cancel_futures=not wait)
 
 
 class JobService:
@@ -172,7 +186,7 @@ class JobService:
                 raise ConflictAppError("active job state changed", "相同链接已有任务在处理中。") from exc
             return active_job
         self.record_event(job.id, level="info", event_type="queued", message="任务已加入队列")
-        self._runner.dispatch(job.id)
+        self._runner.dispatch(job.id, job_type=job.job_type)
         return self._repository.get(job.id) or job
 
     def create_audio_separation(self, *, device: Device, file_name: str, content: bytes) -> Job:
@@ -198,7 +212,7 @@ class JobService:
             media_title=stem,
         )
         self.record_event(job.id, level="info", event_type="queued", message="任务已加入队列")
-        self._runner.dispatch(job.id)
+        self._runner.dispatch(job.id, job_type=job.job_type)
         return self._repository.get(job.id) or job
 
     def list_artifacts(self, job_id: str, device: Device):
@@ -262,7 +276,7 @@ class JobService:
             user_message=None,
             finished_at=None,
         )
-        self._runner.dispatch(job.id)
+        self._runner.dispatch(job.id, job_type=job.job_type)
         return self.get_owned(job.id, device)
 
     def cancel(self, job_id: str, device: Device) -> Job:

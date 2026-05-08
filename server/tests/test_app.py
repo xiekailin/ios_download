@@ -24,6 +24,7 @@ from app.core.config import Settings
 from app.core.errors import AuthorizationError, DownloadAppError, ProviderAppError
 from app.domain.models import ArtifactRole, DeliveryMode, Device, ExtractedMedia, JobStatus, JobType, Platform
 from app.main import app
+from app.services.jobs import BackgroundJobRunner
 from app.services.media_downloader import MediaDownloader
 from app.services.repositories import DeviceRepository
 from app.services.url_tools import (
@@ -58,6 +59,9 @@ class AppTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         os.environ.pop("XDL_AUDIO_SEPARATION_COMMAND", None)
+        os.environ.pop("XDL_PERFORMANCE_MODE", None)
+        os.environ.pop("XDL_DOWNLOAD_WORKER_MAX_JOBS", None)
+        os.environ.pop("XDL_AUDIO_SEPARATION_WORKER_MAX_JOBS", None)
         self.container.close()
         self.temp_dir.cleanup()
 
@@ -101,6 +105,107 @@ class AppTests(unittest.TestCase):
 
     def test_default_download_size_limit_allows_large_videos(self) -> None:
         self.assertGreaterEqual(Settings().download_max_bytes, 3 * 1024 * 1024 * 1024)
+
+    def test_performance_mode_sets_download_and_heavy_task_limits(self) -> None:
+        os.environ["XDL_PERFORMANCE_MODE"] = "performance"
+        os.environ.pop("XDL_WORKER_MAX_JOBS", None)
+        os.environ.pop("XDL_DOWNLOAD_WORKER_MAX_JOBS", None)
+        os.environ.pop("XDL_AUDIO_SEPARATION_WORKER_MAX_JOBS", None)
+
+        settings = Settings.from_env()
+
+        self.assertEqual(settings.performance_mode, "performance")
+        self.assertEqual(settings.download_worker_max_jobs, 4)
+        self.assertEqual(settings.audio_separation_worker_max_jobs, 1)
+
+    def test_low_power_mode_keeps_downloads_serial(self) -> None:
+        os.environ["XDL_PERFORMANCE_MODE"] = "low_power"
+        os.environ.pop("XDL_WORKER_MAX_JOBS", None)
+        os.environ.pop("XDL_DOWNLOAD_WORKER_MAX_JOBS", None)
+        os.environ.pop("XDL_AUDIO_SEPARATION_WORKER_MAX_JOBS", None)
+
+        settings = Settings.from_env()
+
+        self.assertEqual(settings.download_worker_max_jobs, 1)
+        self.assertEqual(settings.audio_separation_worker_max_jobs, 1)
+
+    def test_explicit_worker_limits_override_performance_mode_defaults(self) -> None:
+        os.environ["XDL_PERFORMANCE_MODE"] = "low_power"
+        os.environ["XDL_DOWNLOAD_WORKER_MAX_JOBS"] = "3"
+        os.environ["XDL_AUDIO_SEPARATION_WORKER_MAX_JOBS"] = "2"
+
+        settings = Settings.from_env()
+
+        self.assertEqual(settings.download_worker_max_jobs, 3)
+        self.assertEqual(settings.audio_separation_worker_max_jobs, 2)
+
+    def test_background_runner_keeps_audio_separation_single_flight(self) -> None:
+        started: list[str] = []
+        first_started = threading.Event()
+        second_started = threading.Event()
+        release_first = threading.Event()
+
+        class BlockingWorker:
+            def run(self, job_id: str) -> None:
+                started.append(job_id)
+                if job_id == "audio-1":
+                    first_started.set()
+                    release_first.wait(timeout=2)
+                if job_id == "audio-2":
+                    second_started.set()
+
+        runner = BackgroundJobRunner(
+            BlockingWorker(),
+            max_jobs=4,
+            download_max_jobs=4,
+            audio_separation_max_jobs=1,
+        )
+        try:
+            self.assertTrue(runner.dispatch("audio-1", job_type=JobType.AUDIO_SEPARATION))
+            self.assertTrue(runner.dispatch("audio-2", job_type=JobType.AUDIO_SEPARATION))
+
+            self.assertTrue(first_started.wait(timeout=1))
+            self.assertFalse(second_started.wait(timeout=0.1))
+            self.assertEqual(started, ["audio-1"])
+
+            release_first.set()
+            self.assertTrue(second_started.wait(timeout=1))
+            self.assertEqual(started, ["audio-1", "audio-2"])
+        finally:
+            release_first.set()
+            runner.close(wait=True)
+
+    def test_background_runner_runs_download_while_heavy_task_is_busy(self) -> None:
+        started: list[str] = []
+        audio_started = threading.Event()
+        download_started = threading.Event()
+        release_audio = threading.Event()
+
+        class BlockingWorker:
+            def run(self, job_id: str) -> None:
+                started.append(job_id)
+                if job_id == "audio":
+                    audio_started.set()
+                    release_audio.wait(timeout=2)
+                if job_id == "download":
+                    download_started.set()
+
+        runner = BackgroundJobRunner(
+            BlockingWorker(),
+            max_jobs=1,
+            download_max_jobs=1,
+            audio_separation_max_jobs=1,
+        )
+        try:
+            self.assertTrue(runner.dispatch("audio", job_type=JobType.AUDIO_SEPARATION))
+            self.assertTrue(audio_started.wait(timeout=1))
+            self.assertTrue(runner.dispatch("download", job_type=JobType.DOWNLOAD))
+
+            self.assertTrue(download_started.wait(timeout=1))
+            self.assertEqual(started[:2], ["audio", "download"])
+        finally:
+            release_audio.set()
+            runner.close(wait=True)
 
     def test_youtube_cookie_status_requires_device_authentication(self) -> None:
         response = self.client.get("/api/v1/youtube/cookies/status", headers=self.local_headers)

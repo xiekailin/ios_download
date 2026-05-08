@@ -86,6 +86,8 @@ def build_container() -> AppContainer:
                 worker,
                 max_jobs=settings.worker_max_jobs,
                 enabled=settings.worker_enabled,
+                download_max_jobs=settings.download_worker_max_jobs,
+                audio_separation_max_jobs=settings.audio_separation_worker_max_jobs,
             ),
             artifact_repository,
             job_event_repository,

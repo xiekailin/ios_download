@@ -716,4 +716,12 @@ struct LocalBackendLauncherTests {
     #expect(environment["XDL_BACKEND_LOG_PATH"]?.contains("Application Support") == true)
     #expect(environment["XDL_BACKEND_LOG_PATH"]?.hasSuffix("backend.log") == true)
 }
+
+@Test func localBackendLauncherDefaultsToBalancedResourceProfile() {
+    let environment = LocalBackendLauncher.defaultEnvironment()
+
+    #expect(environment["XDL_PERFORMANCE_MODE"] == "balanced")
+    #expect(environment["XDL_DOWNLOAD_WORKER_MAX_JOBS"] == "2")
+    #expect(environment["XDL_AUDIO_SEPARATION_WORKER_MAX_JOBS"] == "1")
+}
 }

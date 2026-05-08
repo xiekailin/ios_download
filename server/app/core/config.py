@@ -50,6 +50,31 @@ def _get_positive_int_env(name: str, default: int) -> int:
     return value
 
 
+def _get_performance_mode_env() -> str:
+    raw = os.getenv("XDL_PERFORMANCE_MODE", "balanced").strip().lower().replace("-", "_")
+    aliases = {
+        "low": "low_power",
+        "power_saver": "low_power",
+        "normal": "balanced",
+        "high": "performance",
+        "high_performance": "performance",
+    }
+    mode = aliases.get(raw, raw)
+    if mode not in {"low_power", "balanced", "performance"}:
+        raise ValidationAppError("invalid performance mode", "环境变量 XDL_PERFORMANCE_MODE 配置不正确。")
+    return mode
+
+
+def _performance_worker_defaults(mode: str) -> tuple[int, int]:
+    match mode:
+        case "low_power":
+            return 1, 1
+        case "performance":
+            return 4, 1
+        case _:
+            return 2, 1
+
+
 def _is_youtube_url(source_url: str) -> bool:
     parsed = urlparse(source_url.strip())
     if parsed.scheme not in {"http", "https"}:
@@ -84,6 +109,9 @@ class Settings:
     download_max_bytes: int = 10 * 1024 * 1024 * 1024
     worker_enabled: bool = True
     worker_max_jobs: int = 2
+    performance_mode: str = "balanced"
+    download_worker_max_jobs: int = 2
+    audio_separation_worker_max_jobs: int = 1
     register_rate_limit: int = 5
     register_window_seconds: int = 300
     audio_upload_max_bytes: int = 200 * 1024 * 1024
@@ -146,6 +174,9 @@ class Settings:
         bootstrap_code = os.getenv("XDL_BOOTSTRAP_CODE", "")
         if cloud_mode and not bootstrap_code:
             raise ValueError("XDL_BOOTSTRAP_CODE is required when XDL_CLOUD_MODE is true")
+        performance_mode = _get_performance_mode_env()
+        download_default, audio_separation_default = _performance_worker_defaults(performance_mode)
+        worker_max_jobs = _get_positive_int_env("XDL_WORKER_MAX_JOBS", download_default)
         return cls(
             app_name=os.getenv("XDL_APP_NAME", "X Downloader API"),
             env=os.getenv("XDL_ENV", "development"),
@@ -165,7 +196,10 @@ class Settings:
             provider_timeout_seconds=_get_positive_int_env("XDL_PROVIDER_TIMEOUT", 180),
             download_max_bytes=_get_positive_int_env("XDL_DOWNLOAD_MAX_BYTES", 10 * 1024 * 1024 * 1024),
             worker_enabled=_get_bool_env("XDL_WORKER_ENABLED", True),
-            worker_max_jobs=_get_positive_int_env("XDL_WORKER_MAX_JOBS", 2),
+            worker_max_jobs=worker_max_jobs,
+            performance_mode=performance_mode,
+            download_worker_max_jobs=_get_positive_int_env("XDL_DOWNLOAD_WORKER_MAX_JOBS", worker_max_jobs),
+            audio_separation_worker_max_jobs=_get_positive_int_env("XDL_AUDIO_SEPARATION_WORKER_MAX_JOBS", audio_separation_default),
             register_rate_limit=_get_positive_int_env("XDL_REGISTER_RATE_LIMIT", 5),
             register_window_seconds=_get_positive_int_env("XDL_REGISTER_WINDOW_SECONDS", 300),
             audio_upload_max_bytes=_get_positive_int_env("XDL_AUDIO_UPLOAD_MAX_BYTES", 200 * 1024 * 1024),

@@ -345,6 +345,9 @@ public struct LocalBackendLauncher: Sendable {
         environment["XDL_DATABASE_PATH"] = supportDirectory.appending(path: "app.db").path
         environment["XDL_ARTIFACTS_DIR"] = artifactsDirectory.path
         environment["XDL_BACKEND_LOG_PATH"] = supportDirectory.appending(path: "backend.log").path
+        environment["XDL_PERFORMANCE_MODE"] = currentEnvironment["XDL_PERFORMANCE_MODE"] ?? "balanced"
+        environment["XDL_DOWNLOAD_WORKER_MAX_JOBS"] = currentEnvironment["XDL_DOWNLOAD_WORKER_MAX_JOBS"] ?? "2"
+        environment["XDL_AUDIO_SEPARATION_WORKER_MAX_JOBS"] = currentEnvironment["XDL_AUDIO_SEPARATION_WORKER_MAX_JOBS"] ?? "1"
         environment["XDL_YOUTUBE_COOKIES_FROM_BROWSER"] = "chrome"
         environment["XDL_YOUTUBE_REMOTE_COMPONENTS"] = "ejs:github"
         if let demucsPythonURL = demucsPythonURL(supportDirectory: supportDirectory) {

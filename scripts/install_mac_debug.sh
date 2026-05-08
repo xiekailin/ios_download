@@ -83,6 +83,10 @@ if [[ ! -x "${APP_DEST}/Contents/Resources/backend/xdownloader-backend/xdownload
   exit 1
 fi
 
+echo "Signing installed app..."
+codesign --force --deep --sign - "${APP_DEST}"
+codesign --verify --deep --strict "${APP_DEST}"
+
 echo "Opening app..."
 open "${APP_DEST}"
 
