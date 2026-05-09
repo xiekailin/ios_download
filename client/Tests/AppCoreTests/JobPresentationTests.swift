@@ -156,6 +156,7 @@ private func makePresentationJob(
 
 @Test func materialLibraryFilterMatchesJobTypesAndFailures() {
     let video = makePresentationJob(status: .completed)
+    let activeVideo = makePresentationJob(status: .downloading)
     let audio = Job(
         id: "job-2",
         deviceID: "device-1",
@@ -198,14 +199,24 @@ private func makePresentationJob(
         updatedAt: Date(),
         finishedAt: Date()
     )
-    let jobs = [video, audio, separation]
+    let jobs = [video, activeVideo, audio, separation]
 
     #expect(MaterialLibraryFilter.video.matches(video))
+    #expect(MaterialLibraryFilter.active.matches(activeVideo))
+    #expect(MaterialLibraryFilter.completed.matches(video))
+    #expect(!MaterialLibraryFilter.completed.matches(activeVideo))
     #expect(MaterialLibraryFilter.audio.matches(audio))
     #expect(MaterialLibraryFilter.separated.matches(separation))
     #expect(MaterialLibraryFilter.attention.matches(separation))
-    #expect(jobs.filter(MaterialLibraryFilter.all.matches).count == 3)
+    #expect(jobs.filter(MaterialLibraryFilter.all.matches).count == 4)
     #expect(jobs.filter(MaterialLibraryFilter.audio.matches).map(\.id) == ["job-2"])
+}
+
+@Test func jobPresentationMetadataUsesNativeMacLabels() {
+    #expect(JobType.download.presentationTitle == "视频")
+    #expect(JobType.audioDownload.presentationSystemImage == "music.note")
+    #expect(JobStatus.downloading.presentationTitle == "下载中")
+    #expect(JobStatus.failed.presentationSystemImage == "exclamationmark.triangle.fill")
 }
 
 @Test func jobLogEventFormatsTimestamp() {

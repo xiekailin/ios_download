@@ -32,30 +32,11 @@ public struct TaskStatusBadge: View {
     }
 
     private var label: String {
-        switch status {
-        case .created: "已创建"
-        case .queued: "排队中"
-        case .resolving: "解析中"
-        case .resolved: "已解析"
-        case .downloading: "下载中"
-        case .muxing: "合并中"
-        case .storing: "存储中"
-        case .completed: "已完成"
-        case .failed: "失败"
-        case .canceled: "已取消"
-        }
+        status.presentationTitle
     }
 
     private var icon: String {
-        switch status {
-        case .completed: "checkmark.circle.fill"
-        case .failed: "exclamationmark.triangle.fill"
-        case .canceled: "minus.circle.fill"
-        case .downloading: "arrow.down.circle.fill"
-        case .resolving, .resolved: "link.badge.plus"
-        case .muxing, .storing: "gearshape.fill"
-        case .created, .queued: "clock.fill"
-        }
+        status.presentationSystemImage
     }
 
     private var foregroundColor: Color {

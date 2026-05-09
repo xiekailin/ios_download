@@ -26,12 +26,78 @@ public enum JobStatus: String, Codable, Sendable, CaseIterable {
             false
         }
     }
+
+    public var presentationTitle: String {
+        switch self {
+        case .created:
+            "等待中"
+        case .queued:
+            "排队中"
+        case .resolving:
+            "解析中"
+        case .resolved:
+            "已解析"
+        case .downloading:
+            "下载中"
+        case .muxing:
+            "处理中"
+        case .storing:
+            "保存中"
+        case .completed:
+            "已完成"
+        case .failed:
+            "失败"
+        case .canceled:
+            "已取消"
+        }
+    }
+
+    public var presentationSystemImage: String {
+        switch self {
+        case .completed:
+            "checkmark.circle.fill"
+        case .failed:
+            "exclamationmark.triangle.fill"
+        case .canceled:
+            "minus.circle.fill"
+        case .downloading:
+            "arrow.down.circle.fill"
+        case .resolving, .resolved:
+            "link.badge.plus"
+        case .muxing, .storing:
+            "gearshape.fill"
+        case .created, .queued:
+            "clock.fill"
+        }
+    }
 }
 
 public enum JobType: String, Codable, Sendable, CaseIterable {
     case download
     case audioDownload = "audio_download"
     case audioSeparation = "audio_separation"
+
+    public var presentationTitle: String {
+        switch self {
+        case .download:
+            "视频"
+        case .audioDownload:
+            "MP3"
+        case .audioSeparation:
+            "音频拆分"
+        }
+    }
+
+    public var presentationSystemImage: String {
+        switch self {
+        case .download:
+            "film"
+        case .audioDownload:
+            "music.note"
+        case .audioSeparation:
+            "waveform"
+        }
+    }
 }
 
 public enum ArtifactRole: String, Codable, Sendable, CaseIterable {
@@ -42,6 +108,8 @@ public enum ArtifactRole: String, Codable, Sendable, CaseIterable {
 
 public enum MaterialLibraryFilter: String, Codable, Sendable, CaseIterable, Identifiable {
     case all
+    case active
+    case completed
     case video
     case audio
     case separated
@@ -53,6 +121,10 @@ public enum MaterialLibraryFilter: String, Codable, Sendable, CaseIterable, Iden
         switch self {
         case .all:
             "全部"
+        case .active:
+            "下载中"
+        case .completed:
+            "已完成"
         case .video:
             "视频"
         case .audio:
@@ -68,6 +140,10 @@ public enum MaterialLibraryFilter: String, Codable, Sendable, CaseIterable, Iden
         switch self {
         case .all:
             true
+        case .active:
+            !job.status.isTerminal
+        case .completed:
+            job.status == .completed
         case .video:
             job.jobType == .download
         case .audio:

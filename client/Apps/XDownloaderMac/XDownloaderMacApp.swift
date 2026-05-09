@@ -34,33 +34,11 @@ private enum MacNativeStyle {
     }
 
     static func statusSymbol(_ status: JobStatus) -> String {
-        switch status {
-        case .completed:
-            "checkmark.circle.fill"
-        case .failed:
-            "exclamationmark.triangle.fill"
-        case .canceled:
-            "minus.circle.fill"
-        case .downloading:
-            "arrow.down.circle.fill"
-        case .resolving, .resolved:
-            "link.badge.plus"
-        case .muxing, .storing:
-            "gearshape.fill"
-        case .created, .queued:
-            "clock.fill"
-        }
+        status.presentationSystemImage
     }
 
     static func jobTypeSymbol(_ jobType: JobType) -> String {
-        switch jobType {
-        case .download:
-            "film"
-        case .audioDownload:
-            "music.note"
-        case .audioSeparation:
-            "waveform"
-        }
+        jobType.presentationSystemImage
     }
 }
 
@@ -88,6 +66,7 @@ struct XDownloaderMacApp: App {
     @State private var logsJobID: Job.ID?
     @State private var logsLoadErrorMessage: String?
     @State private var artifactActionMessage: String?
+    @State private var isLogSectionExpanded = false
     private static let localSettings = makeLocalSettings()
     private static let localSecret = localSettings.localBackendSecret
     private let fileExporter = FileExportAdapter()
@@ -382,65 +361,38 @@ struct XDownloaderMacApp: App {
     }
 
     private func jobTypeTitle(_ jobType: JobType) -> String {
-        switch jobType {
-        case .download:
-            "视频下载"
-        case .audioDownload:
-            "提取 MP3"
-        case .audioSeparation:
-            "人声/伴奏"
-        }
+        jobType.presentationTitle
     }
 
     private func jobStatusTitle(_ status: JobStatus) -> String {
-        switch status {
-        case .created:
-            "等待中"
-        case .queued:
-            "排队中"
-        case .resolving:
-            "解析中"
-        case .resolved:
-            "已解析"
-        case .downloading:
-            "下载中"
-        case .muxing:
-            "处理中"
-        case .storing:
-            "保存中"
-        case .completed:
-            "已完成"
-        case .failed:
-            "失败"
-        case .canceled:
-            "已取消"
-        }
+        status.presentationTitle
     }
 
     private func sidebarRow(_ job: Job) -> some View {
-        HStack(alignment: .top, spacing: 10) {
+        HStack(alignment: .center, spacing: 9) {
             Image(systemName: MacNativeStyle.statusSymbol(job.status))
-                .font(.system(size: 14, weight: .semibold))
+                .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(MacNativeStyle.statusColor(job.status))
                 .frame(width: 18, height: 18)
-                .padding(.top, 2)
 
-            VStack(alignment: .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 3) {
                 Text(job.mediaTitle ?? job.sourceURL)
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(2)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
                     .foregroundStyle(.primary)
 
                 HStack(spacing: 6) {
-                    Label(jobTypeTitle(job.jobType), systemImage: MacNativeStyle.jobTypeSymbol(job.jobType))
-                        .labelStyle(.titleAndIcon)
+                    Image(systemName: MacNativeStyle.jobTypeSymbol(job.jobType))
+                    Text(jobTypeTitle(job.jobType))
+                    Text("·")
                     Text(jobStatusTitle(job.status))
-                    if !job.status.isTerminal {
-                        Text(job.progressText)
+                    if let speed = job.speedText, !job.status.isTerminal {
+                        Text("·")
+                        Text(speed)
                             .monospacedDigit()
                     }
                 }
-                .font(.caption)
+                .font(.caption2)
                 .foregroundStyle(job.status == .failed ? .red : .secondary)
 
                 if !job.status.isTerminal {
@@ -449,28 +401,90 @@ struct XDownloaderMacApp: App {
                         .tint(MacNativeStyle.statusColor(job.status))
                 }
             }
+            Spacer(minLength: 6)
+            if !job.status.isTerminal {
+                Text(job.progressText)
+                    .font(.caption2.monospacedDigit().weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 34, alignment: .trailing)
+            }
         }
-        .padding(.vertical, 5)
+        .padding(.vertical, 3)
+    }
+
+    private var sidebarHeader: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("素材库")
+                        .font(.headline.weight(.semibold))
+                    Text("\(filteredJobs.count) 个项目")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    isCreatePanelPresented = true
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("新建任务")
+            }
+
+            Picker("筛选", selection: $selectedMaterialFilter) {
+                ForEach(MaterialLibraryFilter.allCases) { filter in
+                    Text(filter.title).tag(filter)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 12)
+        .padding(.bottom, 8)
+    }
+
+    private var sidebarFooter: some View {
+        VStack(spacing: 8) {
+            Divider()
+            Button(role: .destructive) {
+                isClearHistoryConfirmationPresented = true
+            } label: {
+                Label("清理全部历史", systemImage: "trash")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.regular)
+            .disabled(store.jobs.isEmpty || store.isLoading)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 10)
+        }
     }
 
     private func jobHeader(_ job: Job) -> some View {
-        HStack(alignment: .top, spacing: 14) {
+        HStack(alignment: .top, spacing: 12) {
             Image(systemName: MacNativeStyle.jobTypeSymbol(job.jobType))
-                .font(.system(size: 20, weight: .semibold))
+                .font(.system(size: 17, weight: .semibold))
                 .foregroundStyle(MacNativeStyle.statusColor(job.status))
-                .frame(width: 34, height: 34)
+                .frame(width: 30, height: 30)
                 .background(MacNativeStyle.statusColor(job.status).opacity(0.12), in: RoundedRectangle(cornerRadius: MacNativeStyle.cornerRadius))
 
             VStack(alignment: .leading, spacing: 6) {
                 Text(job.mediaTitle ?? job.sourceURL)
-                    .font(.title2.weight(.semibold))
+                    .font(.title3.weight(.semibold))
                     .lineLimit(2)
 
                 HStack(spacing: 8) {
                     Text(jobTypeTitle(job.jobType))
+                    Text("·")
+                    Text(jobStatusTitle(job.status))
                     if let author = job.authorHandle {
+                        Text("·")
                         Text(author)
                     }
+                    Text("·")
                     Text(job.sourceURL)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -483,11 +497,24 @@ struct XDownloaderMacApp: App {
         }
     }
 
+    private func inspectorSection<Content: View>(
+        _ title: String,
+        systemImage: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label(title, systemImage: systemImage)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.primary)
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 12)
+    }
+
     private func jobLogsSection(for job: Job) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("下载日志")
-                    .font(.subheadline.weight(.semibold))
                 Spacer()
                 Button("刷新日志") {
                     Task { await loadJobLogs(for: job) }
@@ -535,12 +562,11 @@ struct XDownloaderMacApp: App {
                 )
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func artifactActionsSection(for job: Job) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("文件操作")
-                .font(.subheadline.weight(.semibold))
             if artifactJobID != job.id {
                 ProgressView("正在加载文件…")
                     .controlSize(.small)
@@ -773,44 +799,51 @@ struct XDownloaderMacApp: App {
 
     private var submitButtons: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Button(action: { previewCurrentURL(jobType: .download) }) {
-                    Label(store.isLoading ? "正在预览…" : "预览链接", systemImage: "eye")
-                        .frame(minWidth: 100)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    previewButton
+                    directDownloadButton
+                    localAudioButton
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(store.isLoading || store.backendHealthStatus == .unhealthy)
-
-                Button(action: submitPreviewSelection) {
-                    Label("跳过预览直接下载", systemImage: "arrow.down.circle")
+                VStack(alignment: .leading, spacing: 8) {
+                    previewButton
+                    directDownloadButton
+                    localAudioButton
                 }
-                .buttonStyle(.bordered)
-                .disabled(store.isLoading || store.backendHealthStatus == .unhealthy)
-            }
-
-            HStack(spacing: 8) {
-                Button(action: selectAudioFileForSeparation) {
-                    Label("拆分本地音频", systemImage: "waveform")
-                }
-                .buttonStyle(.bordered)
-                .disabled(store.isLoading || store.backendHealthStatus == .unhealthy)
-
-                Button {
-                    Task { await controller.refreshJobs(store: store) }
-                } label: {
-                    Label("刷新素材库", systemImage: "arrow.clockwise")
-                }
-                .buttonStyle(.bordered)
-                .disabled(store.isLoading)
             }
         }
     }
 
+    private var previewButton: some View {
+        Button(action: { previewCurrentURL(jobType: .download) }) {
+            Label(store.isLoading ? "正在预览…" : "预览链接", systemImage: "eye")
+                .frame(minWidth: 100)
+        }
+        .buttonStyle(.borderedProminent)
+        .disabled(store.isLoading || store.backendHealthStatus == .unhealthy)
+    }
+
+    private var directDownloadButton: some View {
+        Button(action: submitPreviewSelection) {
+            Label("直接下载", systemImage: "arrow.down.circle")
+        }
+        .buttonStyle(.bordered)
+        .disabled(store.isLoading || store.backendHealthStatus == .unhealthy)
+    }
+
+    private var localAudioButton: some View {
+        Button(action: selectAudioFileForSeparation) {
+            Label("拆分本地音频", systemImage: "waveform")
+        }
+        .buttonStyle(.bordered)
+        .disabled(store.isLoading || store.backendHealthStatus == .unhealthy)
+    }
+
     private func createTaskPanel() -> some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 16) {
             HStack {
                 Label("添加素材", systemImage: "plus.circle")
-                    .font(.headline)
+                    .font(.title3.weight(.semibold))
                 Spacer()
                 if store.backendHealthStatus == .unhealthy {
                     Label("后端未连接", systemImage: "exclamationmark.triangle.fill")
@@ -819,15 +852,20 @@ struct XDownloaderMacApp: App {
                 }
             }
 
-            TextField("粘贴 X、YouTube、Bilibili 等分享链接", text: $store.draftURL)
-                .textFieldStyle(.roundedBorder)
-                .controlSize(.regular)
-                .font(.body)
-                .accessibilityLabel("分享链接")
-                .accessibilityHint("粘贴分享链接后先预览内容，再选择保存视频或提取 MP3。")
-                .onChange(of: store.draftURL) { _, _ in
-                    resetPreviewState()
-                }
+            VStack(alignment: .leading, spacing: 8) {
+                Text("分享链接")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                TextField("粘贴 X、YouTube、Bilibili 等分享链接", text: $store.draftURL)
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.large)
+                    .font(.body)
+                    .accessibilityLabel("分享链接")
+                    .accessibilityHint("粘贴分享链接后先预览内容，再选择保存视频或提取 MP3。")
+                    .onChange(of: store.draftURL) { _, _ in
+                        resetPreviewState()
+                    }
+            }
 
             submitButtons
 
@@ -840,13 +878,18 @@ struct XDownloaderMacApp: App {
                     .font(.footnote)
                     .foregroundStyle(.red)
             }
+
+            HStack {
+                Spacer()
+                Button("关闭") {
+                    isCreatePanelPresented = false
+                }
+                .keyboardShortcut(.cancelAction)
+            }
         }
-        .padding(14)
-        .background(MacNativeStyle.panelBackground, in: RoundedRectangle(cornerRadius: MacNativeStyle.panelRadius))
-        .overlay(
-            RoundedRectangle(cornerRadius: MacNativeStyle.panelRadius)
-                .stroke(MacNativeStyle.border, lineWidth: 1)
-        )
+        .padding(22)
+        .frame(width: 580, alignment: .leading)
+        .background(MacNativeStyle.panelBackground)
     }
 
     private func previewConfirmationCard(_ preview: JobPreview) -> some View {
@@ -929,17 +972,15 @@ struct XDownloaderMacApp: App {
     }
 
     private var emptyHistoryPanel: some View {
-        VStack(alignment: .center, spacing: 12) {
-            Image(systemName: "tray")
-                .font(.system(size: 36))
-                .foregroundStyle(.tertiary)
-            Text(store.jobs.isEmpty ? "还没有保存素材" : "没有匹配的素材")
-                .font(.headline)
+        VStack(spacing: 14) {
+            ContentUnavailableView(
+                store.jobs.isEmpty ? "还没有保存素材" : "没有匹配的素材",
+                systemImage: store.jobs.isEmpty ? "tray" : "line.3.horizontal.decrease.circle",
+                description: Text(store.jobs.isEmpty ? "添加第一个下载任务后，文件和日志会显示在这里。" : "换一个关键词或筛选条件。")
+            )
             if store.jobs.isEmpty {
                 Button {
-                    withAnimation(.snappy) {
-                        isCreatePanelPresented = true
-                    }
+                    isCreatePanelPresented = true
                 } label: {
                     Label("新建第一个任务", systemImage: "plus")
                 }
@@ -952,47 +993,46 @@ struct XDownloaderMacApp: App {
                 .buttonStyle(.bordered)
             }
         }
-        .frame(maxWidth: .infinity, minHeight: 220)
-        .padding(18)
-        .background(MacNativeStyle.panelBackground, in: RoundedRectangle(cornerRadius: MacNativeStyle.panelRadius))
-        .overlay(
-            RoundedRectangle(cornerRadius: MacNativeStyle.panelRadius)
-                .stroke(MacNativeStyle.border, lineWidth: 1)
-        )
+        .frame(maxWidth: .infinity, minHeight: 320)
+        .padding(24)
     }
 
     private func jobDetailPanel(_ job: Job) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 0) {
             jobHeader(job)
+                .padding(.bottom, 14)
 
             Divider()
 
-            VStack(alignment: .leading, spacing: 10) {
-                Text("任务进度")
-                    .font(.subheadline.weight(.semibold))
+            inspectorSection("任务进度", systemImage: "gauge.with.dots.needle.bottom.50percent") {
                 DownloadProgressDetails(job: job)
             }
-            .padding(12)
-            .background(MacNativeStyle.insetBackground, in: RoundedRectangle(cornerRadius: MacNativeStyle.cornerRadius))
-            .overlay(
-                RoundedRectangle(cornerRadius: MacNativeStyle.cornerRadius)
-                    .stroke(MacNativeStyle.border, lineWidth: 1)
-            )
 
             if job.status == .completed {
                 Divider()
-                artifactActionsSection(for: job)
+                inspectorSection("文件", systemImage: "doc") {
+                    artifactActionsSection(for: job)
+                }
             }
 
             Divider()
-            jobLogsSection(for: job)
+            DisclosureGroup(isExpanded: $isLogSectionExpanded) {
+                jobLogsSection(for: job)
+                    .padding(.top, 8)
+            } label: {
+                Label("日志", systemImage: "list.bullet.rectangle")
+                    .font(.subheadline.weight(.semibold))
+            }
+            .padding(.vertical, 12)
 
             if job.status.isTerminal {
                 Divider()
-                terminalJobActions(for: job)
+                inspectorSection("操作", systemImage: "slider.horizontal.3") {
+                    terminalJobActions(for: job)
+                }
             }
         }
-        .padding(16)
+        .padding(18)
         .background(MacNativeStyle.panelBackground, in: RoundedRectangle(cornerRadius: MacNativeStyle.panelRadius))
         .overlay(
             RoundedRectangle(cornerRadius: MacNativeStyle.panelRadius)
@@ -1004,19 +1044,20 @@ struct XDownloaderMacApp: App {
         WindowGroup {
             NavigationSplitView {
                 VStack(spacing: 0) {
-                    Picker("素材筛选", selection: $selectedMaterialFilter) {
-                        ForEach(MaterialLibraryFilter.allCases) { filter in
-                            Text(filter.title).tag(filter)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .padding([.horizontal, .top], 12)
-                    .padding(.bottom, 6)
+                    sidebarHeader
 
                     List(selection: $selectedJobID) {
+                        if !activeJobs.isEmpty {
+                            Section("下载中") {
+                                ForEach(activeJobs) { job in
+                                    sidebarRow(job)
+                                        .tag(job.id)
+                                }
+                            }
+                        }
+
                         if !completedJobs.isEmpty {
-                            Section("已保存素材") {
+                            Section("已完成") {
                                 ForEach(completedJobs) { job in
                                     sidebarRow(job)
                                         .tag(job.id)
@@ -1025,15 +1066,6 @@ struct XDownloaderMacApp: App {
                                                 pendingDeleteJob = job
                                             }
                                         }
-                                }
-                            }
-                        }
-
-                        if !activeJobs.isEmpty {
-                            Section("处理中") {
-                                ForEach(activeJobs) { job in
-                                    sidebarRow(job)
-                                        .tag(job.id)
                                 }
                             }
                         }
@@ -1054,63 +1086,45 @@ struct XDownloaderMacApp: App {
                     }
                     .searchable(text: $jobSearchText, prompt: "搜索素材")
 
-                    Divider()
-
-                    Button(role: .destructive) {
-                        isClearHistoryConfirmationPresented = true
-                    } label: {
-                        Label("清理全部历史", systemImage: "trash")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderless)
-                    .controlSize(.large)
-                    .disabled(store.jobs.isEmpty || store.isLoading)
-                    .padding(12)
+                    sidebarFooter
                 }
                 .navigationTitle("素材库")
             } detail: {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
-                        HStack(alignment: .center) {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("素材库")
-                                    .font(.title2.weight(.semibold))
-                                Text("预览链接后保存为本地素材，完成后可播放、复制或打开所在文件夹。")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Button {
-                                withAnimation(.snappy) {
-                                    isCreatePanelPresented.toggle()
-                                }
-                            } label: {
-                                HStack {
-                                    Image(systemName: isCreatePanelPresented ? "xmark" : "plus")
-                                    Text(isCreatePanelPresented ? "收起" : "新建任务")
-                                }
-                            }
-                            .buttonStyle(.borderedProminent)
-                        }
-
-                        if isCreatePanelPresented {
-                            createTaskPanel()
-                        }
-
+                    VStack(alignment: .leading, spacing: 16) {
                         if let job = visibleSelectedJob {
                             jobDetailPanel(job)
                         } else {
                             emptyHistoryPanel
                         }
                     }
-                    .frame(maxWidth: 800, alignment: .leading)
-                    .padding(24)
+                    .frame(maxWidth: 860, alignment: .leading)
+                    .padding(20)
                     .padding(.bottom, 56)
                 }
                 .background(Color(NSColor.windowBackgroundColor))
+                .navigationTitle(visibleSelectedJob?.mediaTitle ?? "素材库")
             }
             .frame(minWidth: 900, minHeight: 560)
             .toolbar {
+                ToolbarItemGroup(placement: .primaryAction) {
+                    Button {
+                        Task { await controller.refreshJobs(store: store) }
+                    } label: {
+                        Label("刷新素材库", systemImage: "arrow.clockwise")
+                            .labelStyle(.iconOnly)
+                    }
+                    .accessibilityLabel("刷新素材库")
+                    .disabled(store.isLoading)
+
+                    Button {
+                        isCreatePanelPresented = true
+                    } label: {
+                        Label("新建任务", systemImage: "plus")
+                            .labelStyle(.iconOnly)
+                    }
+                    .accessibilityLabel("新建任务")
+                }
                 ToolbarItem(placement: .status) {
                     HStack(spacing: 10) {
                         if store.backendHealthStatus == .unhealthy {
@@ -1130,6 +1144,9 @@ struct XDownloaderMacApp: App {
                     }
                     .font(.caption)
                 }
+            }
+            .sheet(isPresented: $isCreatePanelPresented, onDismiss: resetPreviewState) {
+                createTaskPanel()
             }
             .confirmationDialog(
                 "清理全部历史？",
