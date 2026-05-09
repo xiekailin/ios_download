@@ -724,7 +724,9 @@ struct LocalBackendLauncherTests {
     #expect(environment["XDL_DOWNLOAD_WORKER_MAX_JOBS"] == "2")
     #expect(environment["XDL_AUDIO_SEPARATION_WORKER_MAX_JOBS"] == "1")
     #expect(environment["XDL_YTDLP_CONCURRENT_FRAGMENTS"] == "4")
-    #expect(environment["XDL_YTDLP_FORMAT_STRATEGY"] == "speed")
+    #expect(environment["XDL_YTDLP_FORMAT_STRATEGY"] == "adaptive")
     #expect(environment["XDL_FFMPEG_THREADS"] == "0")
+    #expect(environment["XDL_YTDLP_EXTERNAL_DOWNLOADER"] == "auto")
+    #expect(environment["XDL_YTDLP_EXTERNAL_DOWNLOADER_ARGS"] == "aria2c:-x 8 -s 8 -k 1M")
 }
 }

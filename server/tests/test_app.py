@@ -181,6 +181,13 @@ class AppTests(unittest.TestCase):
         self.assertEqual(settings.ytdlp_format_strategy, "speed")
         self.assertEqual(settings.ffmpeg_threads, 0)
 
+    def test_download_engine_accepts_adaptive_format_strategy_alias(self) -> None:
+        os.environ["XDL_YTDLP_FORMAT_STRATEGY"] = "auto"
+
+        settings = Settings.from_env()
+
+        self.assertEqual(settings.ytdlp_format_strategy, "adaptive")
+
     def test_background_runner_keeps_audio_separation_single_flight(self) -> None:
         started: list[str] = []
         first_started = threading.Event()
@@ -2043,6 +2050,49 @@ class AppTests(unittest.TestCase):
         ]
 
         self.assertEqual(worker._delegate_format_args(source_url="https://www.bilibili.com/video/BV1sRoHB5EHC", ext="mp4"), expected)
+
+    def test_delegate_format_args_adaptive_prefers_fast_mp4_for_delegate_video(self) -> None:
+        self.container.settings.ytdlp_format_strategy = "adaptive"
+        worker = DownloadJobWorker(
+            settings=self.container.settings,
+            jobs=self.container.job_service._repository,
+            artifacts=self.container.artifact_service._artifacts,
+            selector=self.container.job_service._runner.worker._selector,
+        )
+
+        expected = [
+            "-f",
+            "best[ext=mp4]/bestvideo*[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "--merge-output-format",
+            "mp4",
+        ]
+
+        self.assertEqual(worker._delegate_format_args(source_url="https://www.bilibili.com/video/BV1sRoHB5EHC", ext="mp4"), expected)
+
+    def test_delegate_format_args_selected_quality_overrides_adaptive_speed(self) -> None:
+        self.container.settings.ytdlp_format_strategy = "adaptive"
+        worker = DownloadJobWorker(
+            settings=self.container.settings,
+            jobs=self.container.job_service._repository,
+            artifacts=self.container.artifact_service._artifacts,
+            selector=self.container.job_service._runner.worker._selector,
+        )
+
+        expected = [
+            "-f",
+            "bestvideo*[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo*+bestaudio/best",
+            "--merge-output-format",
+            "mp4",
+        ]
+
+        self.assertEqual(
+            worker._delegate_format_args(
+                source_url="https://www.bilibili.com/video/BV1sRoHB5EHC",
+                ext="mp4",
+                selected_quality="quality",
+            ),
+            expected,
+        )
 
     def test_delegate_download_retries_timeout_errors(self) -> None:
         worker = DownloadJobWorker(
@@ -4040,6 +4090,50 @@ class AppTests(unittest.TestCase):
         self.assertEqual(command[command.index("--limit-rate") + 1], "5M")
         self.assertEqual(command[command.index("--downloader") + 1], "aria2c")
         self.assertEqual(command[command.index("--downloader-args") + 1], "aria2c:-x 8 -s 8 -k 1M")
+
+    def test_worker_delegate_download_auto_external_downloader_uses_aria2c_when_available(self) -> None:
+        self.container.settings.ytdlp_external_downloader = "auto"
+        worker = DownloadJobWorker(
+            settings=self.container.settings,
+            jobs=self.container.job_service._repository,
+            artifacts=self.container.artifact_service._artifacts,
+            selector=self.container.job_service._runner.worker._selector,
+            downloader=self.container.job_service._runner.worker._downloader,
+        )
+
+        with patch("app.workers.download_job_worker.shutil.which", return_value="/opt/homebrew/bin/aria2c"):
+            command = worker._delegate_download_command(
+                source_url="https://www.bilibili.com/video/BV1sRoHB5EHC?p=2",
+                output_template=self.container.settings.artifacts_dir / "job-1.%(ext)s",
+                ffmpeg_location="/opt/homebrew/bin",
+                ext="mp4",
+                audio_only=False,
+            )
+
+        self.assertEqual(command[command.index("--downloader") + 1], "aria2c")
+        self.assertEqual(command[command.index("--downloader-args") + 1], "aria2c:-x 8 -s 8 -k 1M")
+
+    def test_worker_delegate_download_skips_auto_external_downloader_when_aria2c_is_missing(self) -> None:
+        self.container.settings.ytdlp_external_downloader = "auto"
+        worker = DownloadJobWorker(
+            settings=self.container.settings,
+            jobs=self.container.job_service._repository,
+            artifacts=self.container.artifact_service._artifacts,
+            selector=self.container.job_service._runner.worker._selector,
+            downloader=self.container.job_service._runner.worker._downloader,
+        )
+
+        with patch("app.workers.download_job_worker.shutil.which", return_value=None):
+            command = worker._delegate_download_command(
+                source_url="https://www.bilibili.com/video/BV1sRoHB5EHC?p=2",
+                output_template=self.container.settings.artifacts_dir / "job-1.%(ext)s",
+                ffmpeg_location="/opt/homebrew/bin",
+                ext="mp4",
+                audio_only=False,
+            )
+
+        self.assertNotIn("--downloader", command)
+        self.assertNotIn("--downloader-args", command)
 
     def test_worker_delegate_download_adds_ffmpeg_postprocessor_thread_flags(self) -> None:
         self.container.settings.ffmpeg_threads = 0

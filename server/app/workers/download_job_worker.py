@@ -35,6 +35,7 @@ _ARTIFACT_INVALID_CHARS_RE = re.compile(r"[\x00-\x1f\\/:*?\"<>|]+")
 _ARTIFACT_WHITESPACE_RE = re.compile(r"\s+")
 _BEST_MP4_FORMAT_SELECTOR = "bestvideo*[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo*+bestaudio/best"
 _FAST_MP4_FORMAT_SELECTOR = "best[ext=mp4]/bestvideo*[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+_ARIA2C_DEFAULT_DOWNLOADER_ARGS = "aria2c:-x 8 -s 8 -k 1M"
 _ALLOWED_ARTIFACT_EXTENSIONS = frozenset({"mp4", "mov", "webm", "m4a", "mp3", "jpg", "jpeg", "png", "webp", "gif"})
 _PROGRESS_UPDATE_INTERVAL_SECONDS = 0.5
 _MAX_DELEGATE_STDERR_LINES = 200
@@ -147,6 +148,7 @@ class DownloadJobWorker:
                     source_url=normalize_extraction_source_url(job.source_url),
                     ext=extracted.file_extension,
                     audio_only=job.job_type == JobType.AUDIO_DOWNLOAD,
+                    selected_quality=job.selected_quality,
                 )
             else:
                 artifact_path = self._download_media(
@@ -325,7 +327,16 @@ class DownloadJobWorker:
             self._cleanup_file(output_path)
             raise
 
-    def _download_via_ytdlp(self, *, job_id: str, title: str | None, source_url: str, ext: str, audio_only: bool = False) -> Path:
+    def _download_via_ytdlp(
+        self,
+        *,
+        job_id: str,
+        title: str | None,
+        source_url: str,
+        ext: str,
+        audio_only: bool = False,
+        selected_quality: str | None = None,
+    ) -> Path:
         output_template = self._settings.artifacts_dir / f"{job_id}.%(ext)s"
         ffmpeg_location = self._resolve_ffmpeg_location()
         command = self._delegate_download_command(
@@ -334,6 +345,7 @@ class DownloadJobWorker:
             ffmpeg_location=ffmpeg_location,
             ext=ext,
             audio_only=audio_only,
+            selected_quality=selected_quality,
         )
         self._run_delegate_download_with_retries(job_id=job_id, command=command, source_url=source_url)
 
@@ -396,6 +408,7 @@ class DownloadJobWorker:
         ffmpeg_location: str,
         ext: str,
         audio_only: bool,
+        selected_quality: str | None = None,
     ) -> list[str]:
         return [
             *self._settings.yt_dlp_command,
@@ -415,7 +428,12 @@ class DownloadJobWorker:
             *self._settings.youtube_runtime_args(source_url),
             "--max-filesize",
             str(self._settings.download_max_bytes),
-            *self._delegate_format_args(source_url=source_url, ext=ext, audio_only=audio_only),
+            *self._delegate_format_args(
+                source_url=source_url,
+                ext=ext,
+                audio_only=audio_only,
+                selected_quality=selected_quality,
+            ),
             *self._delegate_ffmpeg_postprocessor_args(audio_only=audio_only),
             "--ffmpeg-location",
             ffmpeg_location,
@@ -429,11 +447,30 @@ class DownloadJobWorker:
         args: list[str] = []
         if self._settings.download_rate_limit:
             args.extend(["--limit-rate", self._settings.download_rate_limit])
-        if self._settings.ytdlp_external_downloader:
-            args.extend(["--downloader", self._settings.ytdlp_external_downloader])
-        if self._settings.ytdlp_external_downloader_args:
+        downloader = self._resolve_external_downloader()
+        if downloader:
+            args.extend(["--downloader", downloader])
+            downloader_args = self._external_downloader_args(downloader)
+            if downloader_args:
+                args.extend(["--downloader-args", downloader_args])
+        elif self._settings.ytdlp_external_downloader_args and self._settings.ytdlp_external_downloader.strip().lower() != "auto":
             args.extend(["--downloader-args", self._settings.ytdlp_external_downloader_args])
         return args
+
+    def _resolve_external_downloader(self) -> str:
+        configured = self._settings.ytdlp_external_downloader.strip()
+        if not configured:
+            return ""
+        if configured.lower() != "auto":
+            return configured
+        return "aria2c" if shutil.which("aria2c") else ""
+
+    def _external_downloader_args(self, downloader: str) -> str:
+        if self._settings.ytdlp_external_downloader_args:
+            return self._settings.ytdlp_external_downloader_args
+        if self._settings.ytdlp_external_downloader.strip().lower() == "auto" and Path(downloader).name == "aria2c":
+            return _ARIA2C_DEFAULT_DOWNLOADER_ARGS
+        return ""
 
     def _delegate_ffmpeg_postprocessor_args(self, *, audio_only: bool) -> list[str]:
         postprocessor = "ExtractAudio+ffmpeg" if audio_only else "Merger+ffmpeg"
@@ -821,15 +858,46 @@ class DownloadJobWorker:
             return match
         return None
 
-    def _delegate_format_args(self, *, source_url: str, ext: str, audio_only: bool = False) -> list[str]:
+    def _delegate_format_args(
+        self,
+        *,
+        source_url: str,
+        ext: str,
+        audio_only: bool = False,
+        selected_quality: str | None = None,
+    ) -> list[str]:
         if audio_only:
             return ["-f", "bestaudio/best", "-x", "--audio-format", "mp3"]
         normalized_ext = self._normalize_extension(ext)
-        if normalized_ext == "mp4" and self._settings.ytdlp_format_strategy == "speed":
+        strategy = self._delegate_format_strategy(
+            source_url=source_url,
+            ext=normalized_ext,
+            selected_quality=selected_quality,
+        )
+        if normalized_ext == "mp4" and strategy == "speed":
             return ["-f", _FAST_MP4_FORMAT_SELECTOR, "--merge-output-format", "mp4"]
-        if normalized_ext == "mp4" and (self._settings.ytdlp_format_strategy == "quality" or detect_source_platform(source_url) in {"x", "youtube"}):
+        if normalized_ext == "mp4" and (strategy == "quality" or detect_source_platform(source_url) in {"x", "youtube"}):
             return ["-f", _BEST_MP4_FORMAT_SELECTOR, "--merge-output-format", "mp4"]
         return ["--merge-output-format", normalized_ext]
+
+    def _delegate_format_strategy(self, *, source_url: str, ext: str, selected_quality: str | None) -> str:
+        selected_strategy = self._selected_quality_strategy(selected_quality)
+        if selected_strategy is not None:
+            return selected_strategy
+        strategy = self._settings.ytdlp_format_strategy
+        if strategy == "adaptive" and ext == "mp4" and detect_source_platform(source_url) in {"x", "bilibili", "youtube", "pipixia"}:
+            return "speed"
+        return strategy
+
+    def _selected_quality_strategy(self, selected_quality: str | None) -> str | None:
+        if selected_quality is None:
+            return None
+        normalized = selected_quality.strip().lower().replace("-", "_")
+        if normalized in {"speed", "fast", "quick"}:
+            return "speed"
+        if normalized in {"quality", "best", "best_quality", "highest"}:
+            return "quality"
+        return None
 
     def _safe_artifact_stem(self, title: str | None, *, fallback: str) -> str:
         cleaned = _ARTIFACT_INVALID_CHARS_RE.sub(" ", title or "")

@@ -75,13 +75,15 @@ def _get_performance_mode_env() -> str:
 def _get_ytdlp_format_strategy_env() -> str:
     raw = os.getenv("XDL_YTDLP_FORMAT_STRATEGY", "balanced").strip().lower().replace("-", "_")
     aliases = {
+        "auto": "adaptive",
+        "smart": "adaptive",
         "fast": "speed",
         "quick": "speed",
         "best": "quality",
         "best_quality": "quality",
     }
     strategy = aliases.get(raw, raw)
-    if strategy not in {"speed", "balanced", "quality"}:
+    if strategy not in {"adaptive", "speed", "balanced", "quality"}:
         raise ValidationAppError("invalid yt-dlp format strategy", "环境变量 XDL_YTDLP_FORMAT_STRATEGY 配置不正确。")
     return strategy
 
