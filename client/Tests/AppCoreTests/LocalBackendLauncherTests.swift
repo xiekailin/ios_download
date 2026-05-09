@@ -724,5 +724,7 @@ struct LocalBackendLauncherTests {
     #expect(environment["XDL_DOWNLOAD_WORKER_MAX_JOBS"] == "2")
     #expect(environment["XDL_AUDIO_SEPARATION_WORKER_MAX_JOBS"] == "1")
     #expect(environment["XDL_YTDLP_CONCURRENT_FRAGMENTS"] == "4")
+    #expect(environment["XDL_YTDLP_FORMAT_STRATEGY"] == "speed")
+    #expect(environment["XDL_FFMPEG_THREADS"] == "0")
 }
 }

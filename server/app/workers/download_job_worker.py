@@ -34,6 +34,7 @@ _YTDLP_DOWNLOADED_RE = re.compile(r"^\[download\]\s+(?P<size>[0-9.]+(?:[KMGTPE]?
 _ARTIFACT_INVALID_CHARS_RE = re.compile(r"[\x00-\x1f\\/:*?\"<>|]+")
 _ARTIFACT_WHITESPACE_RE = re.compile(r"\s+")
 _BEST_MP4_FORMAT_SELECTOR = "bestvideo*[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo*+bestaudio/best"
+_FAST_MP4_FORMAT_SELECTOR = "best[ext=mp4]/bestvideo*[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
 _ALLOWED_ARTIFACT_EXTENSIONS = frozenset({"mp4", "mov", "webm", "m4a", "mp3", "jpg", "jpeg", "png", "webp", "gif"})
 _PROGRESS_UPDATE_INTERVAL_SECONDS = 0.5
 _MAX_DELEGATE_STDERR_LINES = 200
@@ -415,6 +416,7 @@ class DownloadJobWorker:
             "--max-filesize",
             str(self._settings.download_max_bytes),
             *self._delegate_format_args(source_url=source_url, ext=ext, audio_only=audio_only),
+            *self._delegate_ffmpeg_postprocessor_args(audio_only=audio_only),
             "--ffmpeg-location",
             ffmpeg_location,
             "-o",
@@ -432,6 +434,10 @@ class DownloadJobWorker:
         if self._settings.ytdlp_external_downloader_args:
             args.extend(["--downloader-args", self._settings.ytdlp_external_downloader_args])
         return args
+
+    def _delegate_ffmpeg_postprocessor_args(self, *, audio_only: bool) -> list[str]:
+        postprocessor = "ExtractAudio+ffmpeg" if audio_only else "Merger+ffmpeg"
+        return ["--postprocessor-args", f"{postprocessor}:-threads {self._settings.ffmpeg_threads}"]
 
     def _run_delegate_download(self, *, job_id: str, command: list[str]) -> None:
         try:
@@ -539,6 +545,8 @@ class DownloadJobWorker:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         command = [
             self._settings.ffmpeg_binary,
+            "-threads",
+            str(self._settings.ffmpeg_threads),
             "-i",
             str(source_path),
             "-vn",
@@ -816,9 +824,12 @@ class DownloadJobWorker:
     def _delegate_format_args(self, *, source_url: str, ext: str, audio_only: bool = False) -> list[str]:
         if audio_only:
             return ["-f", "bestaudio/best", "-x", "--audio-format", "mp3"]
-        if detect_source_platform(source_url) in {"x", "youtube"}:
+        normalized_ext = self._normalize_extension(ext)
+        if normalized_ext == "mp4" and self._settings.ytdlp_format_strategy == "speed":
+            return ["-f", _FAST_MP4_FORMAT_SELECTOR, "--merge-output-format", "mp4"]
+        if normalized_ext == "mp4" and (self._settings.ytdlp_format_strategy == "quality" or detect_source_platform(source_url) in {"x", "youtube"}):
             return ["-f", _BEST_MP4_FORMAT_SELECTOR, "--merge-output-format", "mp4"]
-        return ["--merge-output-format", self._normalize_extension(ext)]
+        return ["--merge-output-format", normalized_ext]
 
     def _safe_artifact_stem(self, title: str | None, *, fallback: str) -> str:
         cleaned = _ARTIFACT_INVALID_CHARS_RE.sub(" ", title or "")

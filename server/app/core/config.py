@@ -50,6 +50,13 @@ def _get_positive_int_env(name: str, default: int) -> int:
     return value
 
 
+def _get_nonnegative_int_env(name: str, default: int) -> int:
+    value = _get_int_env(name, default)
+    if value < 0:
+        raise ValidationAppError(f"invalid nonnegative integer for {name}", f"环境变量 {name} 必须大于或等于 0。")
+    return value
+
+
 def _get_performance_mode_env() -> str:
     raw = os.getenv("XDL_PERFORMANCE_MODE", "balanced").strip().lower().replace("-", "_")
     aliases = {
@@ -63,6 +70,20 @@ def _get_performance_mode_env() -> str:
     if mode not in {"low_power", "balanced", "performance"}:
         raise ValidationAppError("invalid performance mode", "环境变量 XDL_PERFORMANCE_MODE 配置不正确。")
     return mode
+
+
+def _get_ytdlp_format_strategy_env() -> str:
+    raw = os.getenv("XDL_YTDLP_FORMAT_STRATEGY", "balanced").strip().lower().replace("-", "_")
+    aliases = {
+        "fast": "speed",
+        "quick": "speed",
+        "best": "quality",
+        "best_quality": "quality",
+    }
+    strategy = aliases.get(raw, raw)
+    if strategy not in {"speed", "balanced", "quality"}:
+        raise ValidationAppError("invalid yt-dlp format strategy", "环境变量 XDL_YTDLP_FORMAT_STRATEGY 配置不正确。")
+    return strategy
 
 
 def _performance_worker_defaults(mode: str) -> tuple[int, int]:
@@ -123,6 +144,8 @@ class Settings:
     download_worker_max_jobs: int = 2
     audio_separation_worker_max_jobs: int = 1
     ytdlp_concurrent_fragments: int = 4
+    ytdlp_format_strategy: str = "balanced"
+    ffmpeg_threads: int = 0
     download_rate_limit: str = ""
     ytdlp_external_downloader: str = ""
     ytdlp_external_downloader_args: str = ""
@@ -216,6 +239,8 @@ class Settings:
             download_worker_max_jobs=_get_positive_int_env("XDL_DOWNLOAD_WORKER_MAX_JOBS", worker_max_jobs),
             audio_separation_worker_max_jobs=_get_positive_int_env("XDL_AUDIO_SEPARATION_WORKER_MAX_JOBS", audio_separation_default),
             ytdlp_concurrent_fragments=_get_positive_int_env("XDL_YTDLP_CONCURRENT_FRAGMENTS", fragment_default),
+            ytdlp_format_strategy=_get_ytdlp_format_strategy_env(),
+            ffmpeg_threads=_get_nonnegative_int_env("XDL_FFMPEG_THREADS", 0),
             download_rate_limit=os.getenv("XDL_DOWNLOAD_RATE_LIMIT", "").strip(),
             ytdlp_external_downloader=os.getenv("XDL_YTDLP_EXTERNAL_DOWNLOADER", "").strip(),
             ytdlp_external_downloader_args=os.getenv("XDL_YTDLP_EXTERNAL_DOWNLOADER_ARGS", "").strip(),

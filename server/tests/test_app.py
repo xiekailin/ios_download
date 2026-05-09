@@ -63,6 +63,8 @@ class AppTests(unittest.TestCase):
         os.environ.pop("XDL_DOWNLOAD_WORKER_MAX_JOBS", None)
         os.environ.pop("XDL_AUDIO_SEPARATION_WORKER_MAX_JOBS", None)
         os.environ.pop("XDL_YTDLP_CONCURRENT_FRAGMENTS", None)
+        os.environ.pop("XDL_YTDLP_FORMAT_STRATEGY", None)
+        os.environ.pop("XDL_FFMPEG_THREADS", None)
         os.environ.pop("XDL_DOWNLOAD_RATE_LIMIT", None)
         os.environ.pop("XDL_YTDLP_EXTERNAL_DOWNLOADER", None)
         os.environ.pop("XDL_YTDLP_EXTERNAL_DOWNLOADER_ARGS", None)
@@ -169,6 +171,15 @@ class AppTests(unittest.TestCase):
         self.assertEqual(settings.download_rate_limit, "5M")
         self.assertEqual(settings.ytdlp_external_downloader, "aria2c")
         self.assertEqual(settings.ytdlp_external_downloader_args, "aria2c:-x 8 -s 8 -k 1M")
+
+    def test_download_engine_accepts_speed_format_strategy_and_ffmpeg_threads(self) -> None:
+        os.environ["XDL_YTDLP_FORMAT_STRATEGY"] = "speed"
+        os.environ["XDL_FFMPEG_THREADS"] = "0"
+
+        settings = Settings.from_env()
+
+        self.assertEqual(settings.ytdlp_format_strategy, "speed")
+        self.assertEqual(settings.ffmpeg_threads, 0)
 
     def test_background_runner_keeps_audio_separation_single_flight(self) -> None:
         started: list[str] = []
@@ -1997,6 +2008,42 @@ class AppTests(unittest.TestCase):
         self.assertEqual(worker._delegate_format_args(source_url="https://x.com/demo/status/12345", ext="mp4"), expected)
         self.assertEqual(worker._delegate_format_args(source_url="https://twitter.com/demo/status/12345", ext="mp4"), expected)
 
+    def test_delegate_format_args_prefers_direct_mp4_when_speed_strategy_is_enabled(self) -> None:
+        self.container.settings.ytdlp_format_strategy = "speed"
+        worker = DownloadJobWorker(
+            settings=self.container.settings,
+            jobs=self.container.job_service._repository,
+            artifacts=self.container.artifact_service._artifacts,
+            selector=self.container.job_service._runner.worker._selector,
+        )
+
+        expected = [
+            "-f",
+            "best[ext=mp4]/bestvideo*[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "--merge-output-format",
+            "mp4",
+        ]
+
+        self.assertEqual(worker._delegate_format_args(source_url="https://www.youtube.com/watch?v=demo", ext="mp4"), expected)
+
+    def test_delegate_format_args_can_keep_quality_first_split_streams(self) -> None:
+        self.container.settings.ytdlp_format_strategy = "quality"
+        worker = DownloadJobWorker(
+            settings=self.container.settings,
+            jobs=self.container.job_service._repository,
+            artifacts=self.container.artifact_service._artifacts,
+            selector=self.container.job_service._runner.worker._selector,
+        )
+
+        expected = [
+            "-f",
+            "bestvideo*[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo*+bestaudio/best",
+            "--merge-output-format",
+            "mp4",
+        ]
+
+        self.assertEqual(worker._delegate_format_args(source_url="https://www.bilibili.com/video/BV1sRoHB5EHC", ext="mp4"), expected)
+
     def test_delegate_download_retries_timeout_errors(self) -> None:
         worker = DownloadJobWorker(
             settings=self.container.settings,
@@ -3104,7 +3151,10 @@ class AppTests(unittest.TestCase):
                     worker.run(job.id)
 
         command = run_mock.call_args.args[0]
-        self.assertEqual(command[1], "-i")
+        self.assertEqual(command[command.index("-threads") + 1], str(self.container.settings.ffmpeg_threads))
+        ffmpeg_input = Path(command[command.index("-i") + 1])
+        self.assertEqual(ffmpeg_input.name, "direct video.mp4")
+        self.assertEqual(ffmpeg_input.parent.name, "Videos")
         self.assertIn("-vn", command)
         self.assertIn("libmp3lame", command)
         updated = self.container.job_service._repository.get(job.id)
@@ -3990,6 +4040,27 @@ class AppTests(unittest.TestCase):
         self.assertEqual(command[command.index("--limit-rate") + 1], "5M")
         self.assertEqual(command[command.index("--downloader") + 1], "aria2c")
         self.assertEqual(command[command.index("--downloader-args") + 1], "aria2c:-x 8 -s 8 -k 1M")
+
+    def test_worker_delegate_download_adds_ffmpeg_postprocessor_thread_flags(self) -> None:
+        self.container.settings.ffmpeg_threads = 0
+        worker = DownloadJobWorker(
+            settings=self.container.settings,
+            jobs=self.container.job_service._repository,
+            artifacts=self.container.artifact_service._artifacts,
+            selector=self.container.job_service._runner.worker._selector,
+            downloader=self.container.job_service._runner.worker._downloader,
+        )
+
+        command = worker._delegate_download_command(
+            source_url="https://www.bilibili.com/video/BV1sRoHB5EHC?p=2",
+            output_template=self.container.settings.artifacts_dir / "job-1.%(ext)s",
+            ffmpeg_location="/opt/homebrew/bin",
+            ext="mp4",
+            audio_only=False,
+        )
+
+        self.assertIn("--postprocessor-args", command)
+        self.assertIn("Merger+ffmpeg:-threads 0", command)
 
     def test_worker_delegate_download_adds_youtube_runtime_flags(self) -> None:
         device = DeviceRepository(self.container.database).create(
