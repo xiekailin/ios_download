@@ -62,6 +62,10 @@ class AppTests(unittest.TestCase):
         os.environ.pop("XDL_PERFORMANCE_MODE", None)
         os.environ.pop("XDL_DOWNLOAD_WORKER_MAX_JOBS", None)
         os.environ.pop("XDL_AUDIO_SEPARATION_WORKER_MAX_JOBS", None)
+        os.environ.pop("XDL_YTDLP_CONCURRENT_FRAGMENTS", None)
+        os.environ.pop("XDL_DOWNLOAD_RATE_LIMIT", None)
+        os.environ.pop("XDL_YTDLP_EXTERNAL_DOWNLOADER", None)
+        os.environ.pop("XDL_YTDLP_EXTERNAL_DOWNLOADER_ARGS", None)
         self.container.close()
         self.temp_dir.cleanup()
 
@@ -138,6 +142,33 @@ class AppTests(unittest.TestCase):
 
         self.assertEqual(settings.download_worker_max_jobs, 3)
         self.assertEqual(settings.audio_separation_worker_max_jobs, 2)
+
+    def test_performance_mode_sets_fragment_download_parallelism(self) -> None:
+        os.environ["XDL_PERFORMANCE_MODE"] = "performance"
+        os.environ.pop("XDL_YTDLP_CONCURRENT_FRAGMENTS", None)
+
+        settings = Settings.from_env()
+
+        self.assertEqual(settings.ytdlp_concurrent_fragments, 8)
+
+    def test_explicit_fragment_parallelism_overrides_performance_mode(self) -> None:
+        os.environ["XDL_PERFORMANCE_MODE"] = "low_power"
+        os.environ["XDL_YTDLP_CONCURRENT_FRAGMENTS"] = "6"
+
+        settings = Settings.from_env()
+
+        self.assertEqual(settings.ytdlp_concurrent_fragments, 6)
+
+    def test_download_engine_accepts_rate_limit_and_external_downloader(self) -> None:
+        os.environ["XDL_DOWNLOAD_RATE_LIMIT"] = "5M"
+        os.environ["XDL_YTDLP_EXTERNAL_DOWNLOADER"] = "aria2c"
+        os.environ["XDL_YTDLP_EXTERNAL_DOWNLOADER_ARGS"] = "aria2c:-x 8 -s 8 -k 1M"
+
+        settings = Settings.from_env()
+
+        self.assertEqual(settings.download_rate_limit, "5M")
+        self.assertEqual(settings.ytdlp_external_downloader, "aria2c")
+        self.assertEqual(settings.ytdlp_external_downloader_args, "aria2c:-x 8 -s 8 -k 1M")
 
     def test_background_runner_keeps_audio_separation_single_flight(self) -> None:
         started: list[str] = []
@@ -1990,6 +2021,35 @@ class AppTests(unittest.TestCase):
                 )
 
         self.assertEqual(calls, 3)
+
+    def test_delegate_download_retries_keep_partial_files_for_resume(self) -> None:
+        worker = DownloadJobWorker(
+            settings=self.container.settings,
+            jobs=self.container.job_service._repository,
+            artifacts=self.container.artifact_service._artifacts,
+            selector=self.container.job_service._runner.worker._selector,
+        )
+        part_path = self.container.settings.artifacts_dir / "job-1.mp4.part"
+        part_path.write_bytes(b"partial")
+        calls = 0
+
+        def fake_run_once(*, job_id: str, command: list[str], source_url: str) -> None:
+            nonlocal calls
+            calls += 1
+            self.assertTrue(part_path.exists())
+            if calls == 1:
+                raise DownloadAppError("yt-dlp download timed out", "下载长时间没有进展，请稍后重试。")
+
+        with patch.object(worker, "_raise_if_job_canceled", return_value=None):
+            with patch.object(worker, "_run_delegate_download_once", side_effect=fake_run_once):
+                worker._run_delegate_download_with_retries(
+                    job_id="job-1",
+                    command=["yt-dlp", "https://x.com/demo/status/12345"],
+                    source_url="https://x.com/demo/status/12345",
+                )
+
+        self.assertEqual(calls, 2)
+        self.assertTrue(part_path.exists())
 
     def test_delegate_download_fails_after_timeout_retries_are_exhausted(self) -> None:
         worker = DownloadJobWorker(
@@ -3883,6 +3943,53 @@ class AppTests(unittest.TestCase):
         self.assertIn("--newline", command)
         self.assertIn(str(self.container.settings.download_max_bytes), command)
         self.assertEqual(command[-1], "https://www.bilibili.com/video/BV1sRoHB5EHC?p=2")
+
+    def test_worker_delegate_download_uses_resume_and_fragment_retry_flags(self) -> None:
+        worker = DownloadJobWorker(
+            settings=self.container.settings,
+            jobs=self.container.job_service._repository,
+            artifacts=self.container.artifact_service._artifacts,
+            selector=self.container.job_service._runner.worker._selector,
+            downloader=self.container.job_service._runner.worker._downloader,
+        )
+
+        command = worker._delegate_download_command(
+            source_url="https://www.bilibili.com/video/BV1sRoHB5EHC?p=2",
+            output_template=self.container.settings.artifacts_dir / "job-1.%(ext)s",
+            ffmpeg_location="/opt/homebrew/bin",
+            ext="mp4",
+            audio_only=False,
+        )
+
+        self.assertIn("--continue", command)
+        self.assertIn("--part", command)
+        self.assertEqual(command[command.index("--retries") + 1], "3")
+        self.assertEqual(command[command.index("--fragment-retries") + 1], "5")
+        self.assertEqual(command[command.index("--concurrent-fragments") + 1], str(self.container.settings.ytdlp_concurrent_fragments))
+
+    def test_worker_delegate_download_adds_rate_limit_and_external_downloader_flags(self) -> None:
+        self.container.settings.download_rate_limit = "5M"
+        self.container.settings.ytdlp_external_downloader = "aria2c"
+        self.container.settings.ytdlp_external_downloader_args = "aria2c:-x 8 -s 8 -k 1M"
+        worker = DownloadJobWorker(
+            settings=self.container.settings,
+            jobs=self.container.job_service._repository,
+            artifacts=self.container.artifact_service._artifacts,
+            selector=self.container.job_service._runner.worker._selector,
+            downloader=self.container.job_service._runner.worker._downloader,
+        )
+
+        command = worker._delegate_download_command(
+            source_url="https://www.bilibili.com/video/BV1sRoHB5EHC?p=2",
+            output_template=self.container.settings.artifacts_dir / "job-1.%(ext)s",
+            ffmpeg_location="/opt/homebrew/bin",
+            ext="mp4",
+            audio_only=False,
+        )
+
+        self.assertEqual(command[command.index("--limit-rate") + 1], "5M")
+        self.assertEqual(command[command.index("--downloader") + 1], "aria2c")
+        self.assertEqual(command[command.index("--downloader-args") + 1], "aria2c:-x 8 -s 8 -k 1M")
 
     def test_worker_delegate_download_adds_youtube_runtime_flags(self) -> None:
         device = DeviceRepository(self.container.database).create(

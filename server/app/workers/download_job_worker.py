@@ -342,13 +342,14 @@ class DownloadJobWorker:
         if artifact_path.stat().st_size > self._settings.download_max_bytes:
             self._cleanup_file(artifact_path)
             raise DownloadAppError("delegated download exceeds size limit")
+        self._cleanup_delegate_partials(job_id)
         return self._finalize_delegate_artifact(artifact_path, title=title, fallback=job_id)
 
     def _run_delegate_download_with_retries(self, *, job_id: str, command: list[str], source_url: str) -> None:
         for attempt in range(_DELEGATE_DOWNLOAD_RETRY_COUNT + 1):
             self._raise_if_job_canceled(job_id)
             if attempt > 0:
-                self._cleanup_delegate_outputs(job_id)
+                self._cleanup_delegate_outputs(job_id, keep_partials=True)
             try:
                 self._run_delegate_download_once(job_id=job_id, command=command, source_url=source_url)
                 return
@@ -401,6 +402,15 @@ class DownloadJobWorker:
             "--no-warnings",
             "--newline",
             "--no-playlist",
+            "--continue",
+            "--part",
+            "--retries",
+            "3",
+            "--fragment-retries",
+            "5",
+            "--concurrent-fragments",
+            str(self._settings.ytdlp_concurrent_fragments),
+            *self._delegate_download_engine_args(),
             *self._settings.youtube_runtime_args(source_url),
             "--max-filesize",
             str(self._settings.download_max_bytes),
@@ -412,6 +422,16 @@ class DownloadJobWorker:
             "--",
             source_url,
         ]
+
+    def _delegate_download_engine_args(self) -> list[str]:
+        args: list[str] = []
+        if self._settings.download_rate_limit:
+            args.extend(["--limit-rate", self._settings.download_rate_limit])
+        if self._settings.ytdlp_external_downloader:
+            args.extend(["--downloader", self._settings.ytdlp_external_downloader])
+        if self._settings.ytdlp_external_downloader_args:
+            args.extend(["--downloader-args", self._settings.ytdlp_external_downloader_args])
+        return args
 
     def _run_delegate_download(self, *, job_id: str, command: list[str]) -> None:
         try:
@@ -883,6 +903,12 @@ class DownloadJobWorker:
         if resolved_path.exists() and resolved_path.is_file():
             resolved_path.unlink()
 
-    def _cleanup_delegate_outputs(self, job_id: str) -> None:
+    def _cleanup_delegate_partials(self, job_id: str) -> None:
+        for path in self._settings.artifacts_dir.glob(f"{job_id}*.part"):
+            self._cleanup_file(path)
+
+    def _cleanup_delegate_outputs(self, job_id: str, *, keep_partials: bool = False) -> None:
         for path in self._settings.artifacts_dir.glob(f"{job_id}.*"):
+            if keep_partials and path.name.endswith(".part"):
+                continue
             self._cleanup_file(path)

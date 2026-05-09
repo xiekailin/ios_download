@@ -75,6 +75,16 @@ def _performance_worker_defaults(mode: str) -> tuple[int, int]:
             return 2, 1
 
 
+def _performance_fragment_defaults(mode: str) -> int:
+    match mode:
+        case "low_power":
+            return 1
+        case "performance":
+            return 8
+        case _:
+            return 4
+
+
 def _is_youtube_url(source_url: str) -> bool:
     parsed = urlparse(source_url.strip())
     if parsed.scheme not in {"http", "https"}:
@@ -112,6 +122,10 @@ class Settings:
     performance_mode: str = "balanced"
     download_worker_max_jobs: int = 2
     audio_separation_worker_max_jobs: int = 1
+    ytdlp_concurrent_fragments: int = 4
+    download_rate_limit: str = ""
+    ytdlp_external_downloader: str = ""
+    ytdlp_external_downloader_args: str = ""
     register_rate_limit: int = 5
     register_window_seconds: int = 300
     audio_upload_max_bytes: int = 200 * 1024 * 1024
@@ -176,6 +190,7 @@ class Settings:
             raise ValueError("XDL_BOOTSTRAP_CODE is required when XDL_CLOUD_MODE is true")
         performance_mode = _get_performance_mode_env()
         download_default, audio_separation_default = _performance_worker_defaults(performance_mode)
+        fragment_default = _performance_fragment_defaults(performance_mode)
         worker_max_jobs = _get_positive_int_env("XDL_WORKER_MAX_JOBS", download_default)
         return cls(
             app_name=os.getenv("XDL_APP_NAME", "X Downloader API"),
@@ -200,6 +215,10 @@ class Settings:
             performance_mode=performance_mode,
             download_worker_max_jobs=_get_positive_int_env("XDL_DOWNLOAD_WORKER_MAX_JOBS", worker_max_jobs),
             audio_separation_worker_max_jobs=_get_positive_int_env("XDL_AUDIO_SEPARATION_WORKER_MAX_JOBS", audio_separation_default),
+            ytdlp_concurrent_fragments=_get_positive_int_env("XDL_YTDLP_CONCURRENT_FRAGMENTS", fragment_default),
+            download_rate_limit=os.getenv("XDL_DOWNLOAD_RATE_LIMIT", "").strip(),
+            ytdlp_external_downloader=os.getenv("XDL_YTDLP_EXTERNAL_DOWNLOADER", "").strip(),
+            ytdlp_external_downloader_args=os.getenv("XDL_YTDLP_EXTERNAL_DOWNLOADER_ARGS", "").strip(),
             register_rate_limit=_get_positive_int_env("XDL_REGISTER_RATE_LIMIT", 5),
             register_window_seconds=_get_positive_int_env("XDL_REGISTER_WINDOW_SECONDS", 300),
             audio_upload_max_bytes=_get_positive_int_env("XDL_AUDIO_UPLOAD_MAX_BYTES", 200 * 1024 * 1024),

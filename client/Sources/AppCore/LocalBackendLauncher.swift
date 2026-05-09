@@ -348,6 +348,7 @@ public struct LocalBackendLauncher: Sendable {
         environment["XDL_PERFORMANCE_MODE"] = currentEnvironment["XDL_PERFORMANCE_MODE"] ?? "balanced"
         environment["XDL_DOWNLOAD_WORKER_MAX_JOBS"] = currentEnvironment["XDL_DOWNLOAD_WORKER_MAX_JOBS"] ?? "2"
         environment["XDL_AUDIO_SEPARATION_WORKER_MAX_JOBS"] = currentEnvironment["XDL_AUDIO_SEPARATION_WORKER_MAX_JOBS"] ?? "1"
+        environment["XDL_YTDLP_CONCURRENT_FRAGMENTS"] = currentEnvironment["XDL_YTDLP_CONCURRENT_FRAGMENTS"] ?? "4"
         environment["XDL_YOUTUBE_COOKIES_FROM_BROWSER"] = "chrome"
         environment["XDL_YOUTUBE_REMOTE_COMPONENTS"] = "ejs:github"
         if let demucsPythonURL = demucsPythonURL(supportDirectory: supportDirectory) {
