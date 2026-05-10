@@ -24,7 +24,7 @@ from app.core.config import Settings
 from app.core.errors import AuthorizationError, DownloadAppError, ProviderAppError
 from app.domain.models import ArtifactRole, DeliveryMode, Device, ExtractedMedia, JobStatus, JobType, Platform
 from app.main import app
-from app.services.jobs import BackgroundJobRunner
+from app.services.jobs import BackgroundJobRunner, JobService
 from app.services.media_downloader import MediaDownloader
 from app.services.repositories import DeviceRepository
 from app.services.url_tools import (
@@ -187,6 +187,82 @@ class AppTests(unittest.TestCase):
         settings = Settings.from_env()
 
         self.assertEqual(settings.ytdlp_format_strategy, "adaptive")
+
+    def test_container_startup_recovers_interrupted_active_jobs(self) -> None:
+        device = DeviceRepository(self.container.database).create(
+            name="Worker Device",
+            platform=Platform.MACOS,
+            app_version="1.0",
+            token_hash="recover-interrupted",
+        )
+        job = self.container.job_service._repository.create(
+            device_id=device.id,
+            source_url="https://www.bilibili.com/video/BV1sRoHB5EHC",
+            normalized_url="https://www.bilibili.com/video/BV1sRoHB5EHC",
+            selected_quality=None,
+        )
+        self.container.job_service._repository.update_status(
+            job.id,
+            status=JobStatus.DOWNLOADING,
+            progress=67,
+            downloaded_bytes=128,
+            total_bytes=256,
+            speed_bytes_per_sec=64,
+            eta_seconds=2,
+        )
+
+        self.container.close()
+        self.container = build_container()
+        app.state.container = self.container
+
+        recovered = self.container.job_service._repository.get(job.id)
+        self.assertEqual(recovered.status, JobStatus.QUEUED)
+        self.assertEqual(recovered.progress, 0)
+        self.assertIsNone(recovered.downloaded_bytes)
+        self.assertIsNone(recovered.speed_bytes_per_sec)
+        events = self.container.job_service.list_events(job.id, limit=20)
+        self.assertTrue(any(event.event_type == "recovered" and "重新加入队列" in event.message for event in events))
+
+    def test_job_service_dispatches_recovered_jobs(self) -> None:
+        device = DeviceRepository(self.container.database).create(
+            name="Worker Device",
+            platform=Platform.IOS,
+            app_version="1.0",
+            token_hash="dispatch-recovered",
+        )
+        job = self.container.job_service._repository.create(
+            device_id=device.id,
+            source_url="https://www.bilibili.com/video/BV1sRoHB5EHC",
+            normalized_url="https://www.bilibili.com/video/BV1sRoHB5EHC",
+            selected_quality=None,
+        )
+        self.container.job_service._repository.update_status(job.id, status=JobStatus.RESOLVING, progress=5)
+
+        class FakeRunner:
+            def __init__(self) -> None:
+                self.dispatched: list[tuple[str, JobType]] = []
+
+            def dispatch(self, job_id: str, *, job_type: JobType = JobType.DOWNLOAD) -> bool:
+                self.dispatched.append((job_id, job_type))
+                return True
+
+            def close(self, *, wait: bool = True) -> None:
+                return None
+
+        runner = FakeRunner()
+        service = JobService(
+            self.container.job_service._repository,
+            runner,
+            self.container.artifact_service._artifacts,
+            self.container.job_service._events,
+            self.container.settings,
+        )
+
+        recovered_count = service.recover_interrupted_jobs()
+
+        self.assertEqual(recovered_count, 1)
+        self.assertEqual(runner.dispatched, [(job.id, JobType.DOWNLOAD)])
+        self.assertEqual(self.container.job_service._repository.get(job.id).status, JobStatus.QUEUED)
 
     def test_background_runner_keeps_audio_separation_single_flight(self) -> None:
         started: list[str] = []
@@ -2819,6 +2895,57 @@ class AppTests(unittest.TestCase):
         self.assertEqual(Path(artifact.storage_path).parent.name, "Videos")
         self.assertTrue(Path(artifact.storage_path).exists())
 
+    def test_worker_records_phase_performance_metrics_for_direct_video(self) -> None:
+        device = DeviceRepository(self.container.database).create(
+            name="Worker Device",
+            platform=Platform.IOS,
+            app_version="1.0",
+            token_hash="worker-performance-metrics",
+        )
+        job = self.container.job_service._repository.create(
+            device_id=device.id,
+            source_url="https://x.com/demo/status/123",
+            normalized_url="https://x.com/demo/status/123",
+            selected_quality=None,
+            job_type=JobType.DOWNLOAD,
+        )
+        worker = DownloadJobWorker(
+            settings=self.container.settings,
+            jobs=self.container.job_service._repository,
+            artifacts=self.container.artifact_service._artifacts,
+            selector=self.container.job_service._runner.worker._selector,
+            downloader=self.container.job_service._runner.worker._downloader,
+        )
+        extracted = ExtractedMedia(
+            provider="yt-dlp",
+            title="video title",
+            author_handle=None,
+            thumbnail_url=None,
+            direct_url="https://video.twimg.com/media/clip.mp4",
+            direct_url_addresses=("8.8.8.8",),
+            webpage_url="https://x.com/demo/status/123",
+            file_extension="mp4",
+        )
+
+        def fake_download(*, output_path: Path, **kwargs) -> None:
+            output_path.write_bytes(b"video")
+
+        with patch.object(worker._selector, "extract", return_value=extracted):
+            with patch.object(worker._downloader, "download", side_effect=fake_download):
+                with patch.object(worker, "_probe_media_details", return_value={}):
+                    worker.run(job.id)
+
+        events = self.container.job_service.list_events(job.id, limit=50)
+        performance_events = [event for event in events if event.event_type == "performance"]
+        self.assertEqual(len(performance_events), 1)
+        message = performance_events[0].message
+        self.assertIn("性能统计", message)
+        self.assertIn("解析", message)
+        self.assertIn("下载", message)
+        self.assertIn("合并", message)
+        self.assertIn("保存", message)
+        self.assertIn("总计", message)
+
     def test_worker_stores_audio_download_in_audio_directory(self) -> None:
         device = DeviceRepository(self.container.database).create(
             name="Worker Device",
@@ -4747,7 +4874,7 @@ class AppTests(unittest.TestCase):
 
         with patch.object(worker._selector, "extract", return_value=extracted):
             with patch("app.workers.download_job_worker.subprocess.Popen", side_effect=lambda command, **kwargs: FakeProcess()):
-                with patch("app.workers.download_job_worker.time.monotonic", side_effect=[1, 3, 3] * 4):
+                with patch("app.workers.download_job_worker.time.monotonic", side_effect=range(100)):
                     with patch("app.workers.download_job_worker.os.killpg") as killpg_mock:
                         worker.run(job.id)
 

@@ -72,7 +72,22 @@ def build_container() -> AppContainer:
         artifacts=artifact_repository,
     )
     worker = JobWorkerDispatcher(job_repository, download_worker, audio_worker)
-    return AppContainer(
+    runner = BackgroundJobRunner(
+        worker,
+        max_jobs=settings.worker_max_jobs,
+        enabled=settings.worker_enabled,
+        download_max_jobs=settings.download_worker_max_jobs,
+        audio_separation_max_jobs=settings.audio_separation_worker_max_jobs,
+    )
+    job_service = JobService(
+        job_repository,
+        runner,
+        artifact_repository,
+        job_event_repository,
+        settings,
+        selector,
+    )
+    container = AppContainer(
         settings=settings,
         database=database,
         device_service=DeviceService(
@@ -80,22 +95,11 @@ def build_container() -> AppContainer:
             device_repository,
             RegisterRateLimiter(settings, register_attempt_repository),
         ),
-        job_service=JobService(
-            job_repository,
-            BackgroundJobRunner(
-                worker,
-                max_jobs=settings.worker_max_jobs,
-                enabled=settings.worker_enabled,
-                download_max_jobs=settings.download_worker_max_jobs,
-                audio_separation_max_jobs=settings.audio_separation_worker_max_jobs,
-            ),
-            artifact_repository,
-            job_event_repository,
-            settings,
-            selector,
-        ),
+        job_service=job_service,
         artifact_service=ArtifactService(settings, artifact_repository, job_repository),
     )
+    job_service.recover_interrupted_jobs()
+    return container
 
 
 def get_container(request: Request) -> AppContainer:

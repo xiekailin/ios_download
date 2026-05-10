@@ -228,6 +228,15 @@ class JobRepository:
             ).fetchall()
         return [_row_to_job(row) for row in rows]
 
+    def list_active(self) -> list[Job]:
+        placeholders = ",".join("?" for _ in _ACTIVE_JOB_STATUSES)
+        with self._database.connection() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM jobs WHERE status IN ({placeholders}) ORDER BY created_at ASC",
+                tuple(status.value for status in _ACTIVE_JOB_STATUSES),
+            ).fetchall()
+        return [_row_to_job(row) for row in rows]
+
     def get_latest_completed_for_device_url(self, device_id: str, normalized_url: str, *, job_type: JobType = JobType.DOWNLOAD) -> Job | None:
         with self._database.connection() as conn:
             row = conn.execute(

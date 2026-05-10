@@ -120,6 +120,28 @@ class JobService:
     def close(self) -> None:
         self._runner.close(wait=True)
 
+    def recover_interrupted_jobs(self) -> int:
+        recovered_count = 0
+        for job in self._repository.list_active():
+            if job.status != JobStatus.QUEUED:
+                self._repository.update_status(
+                    job.id,
+                    status=JobStatus.QUEUED,
+                    progress=0,
+                    downloaded_bytes=None,
+                    total_bytes=None,
+                    speed_bytes_per_sec=None,
+                    eta_seconds=None,
+                    error_code=None,
+                    error_message=None,
+                    user_message=None,
+                    finished_at=None,
+                )
+                self.record_event(job.id, level="warning", event_type="recovered", message="后端重启后恢复任务，已重新加入队列")
+                recovered_count += 1
+            self._runner.dispatch(job.id, job_type=job.job_type)
+        return recovered_count
+
     def create(self, *, device: Device, source_url: str, preferred_quality: str | None) -> Job:
         return self._create_url_job(
             device=device,

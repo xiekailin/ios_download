@@ -100,6 +100,8 @@ class DownloadJobWorker:
         thumbnail_path: Path | None = None
         artifact_id: str | None = None
         delegate_output_prefix: str | None = None
+        phase_timings_ms = {"resolve": 0, "download": 0, "merge": 0, "store": 0, "total": 0}
+        overall_started_at = time.monotonic()
         try:
             if not self._transition_status_with_event(
                 job_id,
@@ -112,7 +114,9 @@ class DownloadJobWorker:
             job = self._jobs.get(job_id)
             if job is None:
                 return
+            resolve_started_at = time.monotonic()
             extracted = self._selector.extract(normalize_extraction_source_url(job.source_url))
+            phase_timings_ms["resolve"] = self._elapsed_ms(resolve_started_at)
             if not self._transition_status_with_event(
                 job_id,
                 from_statuses={JobStatus.RESOLVING},
@@ -140,6 +144,7 @@ class DownloadJobWorker:
                 return
             if job.job_type == JobType.AUDIO_DOWNLOAD and extracted.delivery_mode != DeliveryMode.DELEGATE_YTDLP and extracted.file_extension.lower() in {"jpg", "jpeg", "png", "webp", "gif"}:
                 raise DownloadAppError("no extractable audio found", "该链接没有可提取的音频。")
+            download_started_at = time.monotonic()
             if extracted.delivery_mode == DeliveryMode.DELEGATE_YTDLP:
                 delegate_output_prefix = job_id
                 artifact_path = self._download_via_ytdlp(
@@ -150,6 +155,7 @@ class DownloadJobWorker:
                     audio_only=job.job_type == JobType.AUDIO_DOWNLOAD,
                     selected_quality=job.selected_quality,
                 )
+                phase_timings_ms["download"] = self._elapsed_ms(download_started_at)
             else:
                 artifact_path = self._download_media(
                     job_id=job_id,
@@ -158,8 +164,12 @@ class DownloadJobWorker:
                     allowed_addresses=extracted.direct_url_addresses,
                     ext=extracted.file_extension,
                 )
+                phase_timings_ms["download"] = self._elapsed_ms(download_started_at)
                 if job.job_type == JobType.AUDIO_DOWNLOAD:
+                    merge_started_at = time.monotonic()
                     artifact_path = self._extract_mp3(job_id=job_id, title=extracted.title, source_path=artifact_path)
+                    phase_timings_ms["merge"] = self._elapsed_ms(merge_started_at)
+            store_started_at = time.monotonic()
             current = self._jobs.get(job_id)
             if not self._transition_status_with_event(
                 job_id,
@@ -208,6 +218,10 @@ class DownloadJobWorker:
                 if thumbnail_path is not None:
                     self._cleanup_file(thumbnail_path)
                 self._cleanup_file(artifact_path)
+                return
+            phase_timings_ms["store"] = self._elapsed_ms(store_started_at)
+            phase_timings_ms["total"] = self._elapsed_ms(overall_started_at)
+            self._record_performance_event(job_id, phase_timings_ms)
         except (ProviderAppError, DownloadAppError) as exc:
             self._mark_failed(job_id, error_code=exc.code, error_message=exc.message, user_message=exc.user_message)
             if artifact_id is not None:
@@ -240,6 +254,27 @@ class DownloadJobWorker:
         if changed:
             self._jobs.create_event(job_id, level="info", event_type=kwargs["to_status"].value, message=message)
         return changed
+
+    def _record_performance_event(self, job_id: str, timings_ms: dict[str, int]) -> None:
+        self._jobs.create_event(
+            job_id,
+            level="info",
+            event_type="performance",
+            message=self._performance_message(timings_ms),
+        )
+
+    def _performance_message(self, timings_ms: dict[str, int]) -> str:
+        return (
+            "性能统计："
+            f"解析 {timings_ms.get('resolve', 0)}ms，"
+            f"下载 {timings_ms.get('download', 0)}ms，"
+            f"合并/转换 {timings_ms.get('merge', 0)}ms，"
+            f"保存 {timings_ms.get('store', 0)}ms，"
+            f"总计 {timings_ms.get('total', 0)}ms"
+        )
+
+    def _elapsed_ms(self, started_at: float) -> int:
+        return max(0, int((time.monotonic() - started_at) * 1000))
 
     def _mark_failed(self, job_id: str, *, error_code: str, error_message: str, user_message: str) -> None:
         current = self._jobs.get(job_id)
