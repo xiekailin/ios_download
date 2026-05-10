@@ -89,7 +89,12 @@ class DownloadJobWorker:
         self._jobs = jobs
         self._artifacts = artifacts
         self._selector = selector
-        self._downloader = downloader or MediaDownloader(max_bytes=self._settings.download_max_bytes)
+        self._downloader = downloader or MediaDownloader(
+            max_bytes=self._settings.download_max_bytes,
+            max_connections=self._settings.direct_download_max_connections,
+            segment_min_bytes=self._settings.direct_download_segment_min_bytes,
+            segment_size_bytes=self._settings.direct_download_segment_size,
+        )
 
     def run(self, job_id: str) -> None:
         job = self._jobs.get(job_id)

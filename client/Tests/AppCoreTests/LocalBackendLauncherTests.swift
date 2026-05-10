@@ -728,5 +728,8 @@ struct LocalBackendLauncherTests {
     #expect(environment["XDL_FFMPEG_THREADS"] == "0")
     #expect(environment["XDL_YTDLP_EXTERNAL_DOWNLOADER"] == "auto")
     #expect(environment["XDL_YTDLP_EXTERNAL_DOWNLOADER_ARGS"] == "aria2c:-x 8 -s 8 -k 1M")
+    #expect(environment["XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS"] == "4")
+    #expect(environment["XDL_DIRECT_DOWNLOAD_SEGMENT_MIN_BYTES"] == "8388608")
+    #expect(environment["XDL_DIRECT_DOWNLOAD_SEGMENT_SIZE"] == "4194304")
 }
 }

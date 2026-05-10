@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+import math
 import os
 from ipaddress import ip_address
 from pathlib import Path
 import random
 import socket
 import ssl
+import threading
 import time
 from typing import BinaryIO, Callable
 from urllib.parse import urlparse, urlunparse
@@ -20,25 +23,44 @@ _MAX_LINE_BYTES = 4 * 1024
 ProgressCallback = Callable[[int, int | None, int | None, int | None], None]
 
 
+@dataclass(frozen=True, slots=True)
+class _Segment:
+    index: int
+    start: int
+    end: int
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start + 1
+
+
+@dataclass(frozen=True, slots=True)
+class _RangeProbe:
+    total_bytes: int
+
+
 @dataclass(slots=True)
 class _ProgressTracker:
     callback: ProgressCallback | None
     total_bytes: int | None
     downloaded_bytes: int = 0
     started_at: float = field(default_factory=time.monotonic)
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def advance(self, chunk_size: int) -> None:
-        self.downloaded_bytes += chunk_size
+        with self.lock:
+            self.downloaded_bytes += chunk_size
+            downloaded_bytes = self.downloaded_bytes
+            elapsed = max(time.monotonic() - self.started_at, 0.001)
+            speed_bytes_per_sec = max(1, int(downloaded_bytes / elapsed))
+            eta_seconds: int | None = None
+            if self.total_bytes is not None and speed_bytes_per_sec > 0:
+                remaining_bytes = max(0, self.total_bytes - downloaded_bytes)
+                eta_seconds = int(remaining_bytes / speed_bytes_per_sec)
         if self.callback is None:
             return
-        elapsed = max(time.monotonic() - self.started_at, 0.001)
-        speed_bytes_per_sec = max(1, int(self.downloaded_bytes / elapsed))
-        eta_seconds: int | None = None
-        if self.total_bytes is not None and speed_bytes_per_sec > 0:
-            remaining_bytes = max(0, self.total_bytes - self.downloaded_bytes)
-            eta_seconds = int(remaining_bytes / speed_bytes_per_sec)
         self.callback(
-            self.downloaded_bytes,
+            downloaded_bytes,
             self.total_bytes,
             speed_bytes_per_sec,
             eta_seconds,
@@ -46,8 +68,18 @@ class _ProgressTracker:
 
 
 class MediaDownloader:
-    def __init__(self, *, max_bytes: int = 512 * 1024 * 1024) -> None:
+    def __init__(
+        self,
+        *,
+        max_bytes: int = 512 * 1024 * 1024,
+        max_connections: int = 1,
+        segment_min_bytes: int = 8 * 1024 * 1024,
+        segment_size_bytes: int = 4 * 1024 * 1024,
+    ) -> None:
         self._max_bytes = max_bytes
+        self._max_connections = max(1, max_connections)
+        self._segment_min_bytes = max(1, segment_min_bytes)
+        self._segment_size_bytes = max(1, segment_size_bytes)
 
     def download(
         self,
@@ -111,19 +143,186 @@ class MediaDownloader:
         ssl_context: ssl.SSLContext,
         progress_callback: ProgressCallback | None,
     ) -> None:
+        if self._max_connections > 1:
+            probe = self._probe_range_support(
+                host=host,
+                port=port,
+                path_and_query=path_and_query,
+                address=address,
+                timeout_seconds=timeout_seconds,
+                ssl_context=ssl_context,
+            )
+            if probe is not None:
+                self._download_segmented_from_address(
+                    host=host,
+                    port=port,
+                    path_and_query=path_and_query,
+                    address=address,
+                    output_path=output_path,
+                    timeout_seconds=timeout_seconds,
+                    ssl_context=ssl_context,
+                    total_bytes=probe.total_bytes,
+                    progress_callback=progress_callback,
+                )
+                return
+
         with socket.create_connection((address, port), timeout=timeout_seconds) as tcp_socket:
             with ssl_context.wrap_socket(tcp_socket, server_hostname=host) as tls_socket:
-                request = (
-                    f"GET {path_and_query} HTTP/1.1\r\n"
-                    f"Host: {host}\r\n"
-                    "User-Agent: XDownloader/0.1\r\n"
-                    "Connection: close\r\n"
-                    "Accept: */*\r\n\r\n"
-                )
-                tls_socket.sendall(request.encode("ascii"))
+                self._send_request(tls_socket, method="GET", host=host, path_and_query=path_and_query)
                 tls_socket.settimeout(timeout_seconds)
                 with self._open_output_file(output_path) as output_file:
                     self._read_response_body(tls_socket, output_file, progress_callback)
+
+    def _probe_range_support(
+        self,
+        *,
+        host: str,
+        port: int,
+        path_and_query: str,
+        address: str,
+        timeout_seconds: int,
+        ssl_context: ssl.SSLContext,
+    ) -> _RangeProbe | None:
+        try:
+            with socket.create_connection((address, port), timeout=timeout_seconds) as tcp_socket:
+                with ssl_context.wrap_socket(tcp_socket, server_hostname=host) as tls_socket:
+                    self._send_request(tls_socket, method="HEAD", host=host, path_and_query=path_and_query)
+                    tls_socket.settimeout(timeout_seconds)
+                    status_code, headers, _ = self._read_headers(tls_socket)
+        except DownloadAppError:
+            return None
+
+        if status_code != 200:
+            return None
+        try:
+            content_length = self._parse_content_length(headers)
+        except DownloadAppError:
+            return None
+        if content_length is None:
+            return None
+        if content_length > self._max_bytes:
+            raise DownloadAppError("media file is too large")
+        if content_length < self._segment_min_bytes or content_length <= self._segment_size_bytes:
+            return None
+        if "bytes" not in headers.get("accept-ranges", "").lower():
+            return None
+        if headers.get("content-encoding"):
+            return None
+        return _RangeProbe(total_bytes=content_length)
+
+    def _download_segmented_from_address(
+        self,
+        *,
+        host: str,
+        port: int,
+        path_and_query: str,
+        address: str,
+        output_path: Path,
+        timeout_seconds: int,
+        ssl_context: ssl.SSLContext,
+        total_bytes: int,
+        progress_callback: ProgressCallback | None,
+    ) -> None:
+        if output_path.exists():
+            raise DownloadAppError("temporary download path already exists")
+
+        segments = self._build_segments(total_bytes)
+        part_paths = [output_path.with_name(f"{output_path.name}.segment-{segment.index}") for segment in segments]
+        for part_path in part_paths:
+            if part_path.exists():
+                raise DownloadAppError("temporary download path already exists")
+
+        tracker = _ProgressTracker(callback=progress_callback, total_bytes=total_bytes)
+        try:
+            with ThreadPoolExecutor(max_workers=min(self._max_connections, len(segments))) as executor:
+                futures = [
+                    executor.submit(
+                        self._download_segment,
+                        host=host,
+                        port=port,
+                        path_and_query=path_and_query,
+                        address=address,
+                        output_path=part_path,
+                        timeout_seconds=timeout_seconds,
+                        ssl_context=ssl_context,
+                        segment=segment,
+                        tracker=tracker,
+                    )
+                    for segment, part_path in zip(segments, part_paths, strict=True)
+                ]
+                for future in as_completed(futures):
+                    future.result()
+            self._combine_segments(part_paths, output_path)
+        except DownloadAppError:
+            self._cleanup_segmented_download(output_path, part_paths)
+            raise
+        except Exception as exc:
+            self._cleanup_segmented_download(output_path, part_paths)
+            raise DownloadAppError("segmented download failed") from exc
+        finally:
+            for part_path in part_paths:
+                if part_path.exists():
+                    part_path.unlink()
+
+    def _download_segment(
+        self,
+        *,
+        host: str,
+        port: int,
+        path_and_query: str,
+        address: str,
+        output_path: Path,
+        timeout_seconds: int,
+        ssl_context: ssl.SSLContext,
+        segment: _Segment,
+        tracker: _ProgressTracker,
+    ) -> None:
+        with socket.create_connection((address, port), timeout=timeout_seconds) as tcp_socket:
+            with ssl_context.wrap_socket(tcp_socket, server_hostname=host) as tls_socket:
+                self._send_request(
+                    tls_socket,
+                    method="GET",
+                    host=host,
+                    path_and_query=path_and_query,
+                    extra_headers=(f"Range: bytes={segment.start}-{segment.end}",),
+                )
+                tls_socket.settimeout(timeout_seconds)
+                status_code, headers, remaining = self._read_headers(tls_socket)
+                if status_code != 206:
+                    raise DownloadAppError(f"unexpected ranged download status {status_code}")
+                content_length = self._parse_content_length(headers)
+                if content_length is not None and content_length != segment.length:
+                    raise DownloadAppError("ranged download length mismatch")
+                content_range = headers.get("content-range")
+                if content_range and not content_range.lower().startswith(f"bytes {segment.start}-{segment.end}/"):
+                    raise DownloadAppError("ranged download content range mismatch")
+                with self._open_output_file(output_path) as output_file:
+                    if content_length is None:
+                        self._read_until_close(tls_socket, output_file, remaining, tracker)
+                    else:
+                        self._read_fixed_body(tls_socket, output_file, remaining, content_length, tracker)
+        if output_path.stat().st_size != segment.length:
+            raise DownloadAppError("ranged download length mismatch")
+
+    def _send_request(
+        self,
+        tls_socket: ssl.SSLSocket,
+        *,
+        method: str,
+        host: str,
+        path_and_query: str,
+        extra_headers: tuple[str, ...] = (),
+    ) -> None:
+        header_lines = [
+            f"{method} {path_and_query} HTTP/1.1",
+            f"Host: {host}",
+            "User-Agent: XDownloader/0.1",
+            "Connection: close",
+            "Accept: */*",
+            *extra_headers,
+        ]
+        request = "\r\n".join(header_lines) + "\r\n\r\n"
+        tls_socket.sendall(request.encode("ascii"))
 
     def _read_response_body(
         self,
@@ -136,22 +335,58 @@ class MediaDownloader:
             raise DownloadAppError(f"unexpected download status {status_code}")
 
         transfer_encoding = headers.get("transfer-encoding", "").lower()
-        content_length = headers.get("content-length")
-        if content_length is not None:
-            try:
-                declared_length = int(content_length)
-            except ValueError as exc:
-                raise DownloadAppError("invalid content length") from exc
+        declared_length = self._parse_content_length(headers)
+        if declared_length is not None:
             if declared_length > self._max_bytes:
                 raise DownloadAppError("media file is too large")
-        tracker = _ProgressTracker(callback=progress_callback, total_bytes=declared_length if content_length is not None else None)
+        tracker = _ProgressTracker(callback=progress_callback, total_bytes=declared_length)
         if "chunked" in transfer_encoding:
             self._read_chunked_body(tls_socket, output_file, remaining, tracker)
             return
-        if content_length is not None:
+        if declared_length is not None:
             self._read_fixed_body(tls_socket, output_file, remaining, declared_length, tracker)
             return
         self._read_until_close(tls_socket, output_file, remaining, tracker)
+
+    def _parse_content_length(self, headers: dict[str, str]) -> int | None:
+        content_length = headers.get("content-length")
+        if content_length is None:
+            return None
+        try:
+            declared_length = int(content_length)
+        except ValueError as exc:
+            raise DownloadAppError("invalid content length") from exc
+        if declared_length < 0:
+            raise DownloadAppError("invalid content length")
+        return declared_length
+
+    def _build_segments(self, total_bytes: int) -> list[_Segment]:
+        segment_count = min(self._max_connections, math.ceil(total_bytes / self._segment_size_bytes))
+        segments: list[_Segment] = []
+        segment_size = math.ceil(total_bytes / segment_count)
+        start = 0
+        for index in range(segment_count):
+            end = min(total_bytes - 1, start + segment_size - 1)
+            segments.append(_Segment(index=index, start=start, end=end))
+            start = end + 1
+        return segments
+
+    def _combine_segments(self, part_paths: list[Path], output_path: Path) -> None:
+        with self._open_output_file(output_path) as output_file:
+            for part_path in part_paths:
+                with part_path.open("rb") as part_file:
+                    while True:
+                        chunk = part_file.read(_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        output_file.write(chunk)
+
+    def _cleanup_segmented_download(self, output_path: Path, part_paths: list[Path]) -> None:
+        if output_path.exists():
+            output_path.unlink()
+        for part_path in part_paths:
+            if part_path.exists():
+                part_path.unlink()
 
     def _read_headers(self, tls_socket: ssl.SSLSocket) -> tuple[int, dict[str, str], bytes]:
         buffer = bytearray()

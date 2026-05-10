@@ -108,6 +108,16 @@ def _performance_fragment_defaults(mode: str) -> int:
             return 4
 
 
+def _performance_direct_download_defaults(mode: str) -> int:
+    match mode:
+        case "low_power":
+            return 1
+        case "performance":
+            return 8
+        case _:
+            return 4
+
+
 def _is_youtube_url(source_url: str) -> bool:
     parsed = urlparse(source_url.strip())
     if parsed.scheme not in {"http", "https"}:
@@ -146,6 +156,9 @@ class Settings:
     download_worker_max_jobs: int = 2
     audio_separation_worker_max_jobs: int = 1
     ytdlp_concurrent_fragments: int = 4
+    direct_download_max_connections: int = 4
+    direct_download_segment_min_bytes: int = 8 * 1024 * 1024
+    direct_download_segment_size: int = 4 * 1024 * 1024
     ytdlp_format_strategy: str = "balanced"
     ffmpeg_threads: int = 0
     download_rate_limit: str = ""
@@ -216,6 +229,7 @@ class Settings:
         performance_mode = _get_performance_mode_env()
         download_default, audio_separation_default = _performance_worker_defaults(performance_mode)
         fragment_default = _performance_fragment_defaults(performance_mode)
+        direct_download_default = _performance_direct_download_defaults(performance_mode)
         worker_max_jobs = _get_positive_int_env("XDL_WORKER_MAX_JOBS", download_default)
         return cls(
             app_name=os.getenv("XDL_APP_NAME", "X Downloader API"),
@@ -241,6 +255,9 @@ class Settings:
             download_worker_max_jobs=_get_positive_int_env("XDL_DOWNLOAD_WORKER_MAX_JOBS", worker_max_jobs),
             audio_separation_worker_max_jobs=_get_positive_int_env("XDL_AUDIO_SEPARATION_WORKER_MAX_JOBS", audio_separation_default),
             ytdlp_concurrent_fragments=_get_positive_int_env("XDL_YTDLP_CONCURRENT_FRAGMENTS", fragment_default),
+            direct_download_max_connections=_get_positive_int_env("XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS", direct_download_default),
+            direct_download_segment_min_bytes=_get_positive_int_env("XDL_DIRECT_DOWNLOAD_SEGMENT_MIN_BYTES", 8 * 1024 * 1024),
+            direct_download_segment_size=_get_positive_int_env("XDL_DIRECT_DOWNLOAD_SEGMENT_SIZE", 4 * 1024 * 1024),
             ytdlp_format_strategy=_get_ytdlp_format_strategy_env(),
             ffmpeg_threads=_get_nonnegative_int_env("XDL_FFMPEG_THREADS", 0),
             download_rate_limit=os.getenv("XDL_DOWNLOAD_RATE_LIMIT", "").strip(),

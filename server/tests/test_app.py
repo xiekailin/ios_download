@@ -65,6 +65,9 @@ class AppTests(unittest.TestCase):
         os.environ.pop("XDL_YTDLP_CONCURRENT_FRAGMENTS", None)
         os.environ.pop("XDL_YTDLP_FORMAT_STRATEGY", None)
         os.environ.pop("XDL_FFMPEG_THREADS", None)
+        os.environ.pop("XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS", None)
+        os.environ.pop("XDL_DIRECT_DOWNLOAD_SEGMENT_MIN_BYTES", None)
+        os.environ.pop("XDL_DIRECT_DOWNLOAD_SEGMENT_SIZE", None)
         os.environ.pop("XDL_DOWNLOAD_RATE_LIMIT", None)
         os.environ.pop("XDL_YTDLP_EXTERNAL_DOWNLOADER", None)
         os.environ.pop("XDL_YTDLP_EXTERNAL_DOWNLOADER_ARGS", None)
@@ -153,6 +156,14 @@ class AppTests(unittest.TestCase):
 
         self.assertEqual(settings.ytdlp_concurrent_fragments, 8)
 
+    def test_performance_mode_sets_direct_download_parallelism(self) -> None:
+        os.environ["XDL_PERFORMANCE_MODE"] = "performance"
+        os.environ.pop("XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS", None)
+
+        settings = Settings.from_env()
+
+        self.assertEqual(settings.direct_download_max_connections, 8)
+
     def test_explicit_fragment_parallelism_overrides_performance_mode(self) -> None:
         os.environ["XDL_PERFORMANCE_MODE"] = "low_power"
         os.environ["XDL_YTDLP_CONCURRENT_FRAGMENTS"] = "6"
@@ -160,6 +171,17 @@ class AppTests(unittest.TestCase):
         settings = Settings.from_env()
 
         self.assertEqual(settings.ytdlp_concurrent_fragments, 6)
+
+    def test_download_engine_accepts_direct_segmented_download_settings(self) -> None:
+        os.environ["XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS"] = "6"
+        os.environ["XDL_DIRECT_DOWNLOAD_SEGMENT_MIN_BYTES"] = "1024"
+        os.environ["XDL_DIRECT_DOWNLOAD_SEGMENT_SIZE"] = "512"
+
+        settings = Settings.from_env()
+
+        self.assertEqual(settings.direct_download_max_connections, 6)
+        self.assertEqual(settings.direct_download_segment_min_bytes, 1024)
+        self.assertEqual(settings.direct_download_segment_size, 512)
 
     def test_download_engine_accepts_rate_limit_and_external_downloader(self) -> None:
         os.environ["XDL_DOWNLOAD_RATE_LIMIT"] = "5M"
@@ -2804,6 +2826,124 @@ class AppTests(unittest.TestCase):
         self.assertEqual(progress_events[-1][0], 11)
         self.assertEqual(progress_events[-1][1], 11)
         self.assertIsNotNone(progress_events[-1][2])
+
+    def test_media_downloader_uses_parallel_range_segments_when_supported(self) -> None:
+        body = b"0123456789"
+        requests: list[str] = []
+        progress_events: list[tuple[int, int | None, int | None, int | None]] = []
+
+        class FakeSocket:
+            def __init__(self) -> None:
+                self._chunks: list[bytes] = []
+
+            def sendall(self, data: bytes) -> None:
+                request = data.decode("ascii")
+                requests.append(request)
+                if request.startswith("HEAD "):
+                    self._chunks = [
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nAccept-Ranges: bytes\r\n\r\n",
+                        b"",
+                    ]
+                    return
+                range_line = next(line for line in request.split("\r\n") if line.startswith("Range: "))
+                start_text, end_text = range_line.removeprefix("Range: bytes=").split("-")
+                start = int(start_text)
+                end = int(end_text)
+                chunk = body[start : end + 1]
+                response = (
+                    f"HTTP/1.1 206 Partial Content\r\n"
+                    f"Content-Length: {len(chunk)}\r\n"
+                    f"Content-Range: bytes {start}-{end}/{len(body)}\r\n"
+                    "\r\n"
+                ).encode("ascii")
+                self._chunks = [response + chunk, b""]
+
+            def recv(self, _: int) -> bytes:
+                return self._chunks.pop(0) if self._chunks else b""
+
+            def settimeout(self, timeout: int) -> None:
+                self.timeout = timeout
+
+            def __enter__(self) -> "FakeSocket":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        output_path = self.container.settings.artifacts_dir / "segmented.part"
+        downloader = MediaDownloader(max_bytes=100, max_connections=3, segment_min_bytes=1, segment_size_bytes=4)
+        with patch("app.services.media_downloader.socket.create_connection", side_effect=lambda address, timeout: FakeSocket()):
+            with patch.object(ssl.SSLContext, "wrap_socket", side_effect=lambda sock, server_hostname: sock):
+                downloader.download(
+                    url="https://video.twimg.com/media/clip.mp4",
+                    allowed_addresses=("8.8.8.8",),
+                    output_path=output_path,
+                    timeout_seconds=5,
+                    progress_callback=lambda downloaded_bytes, total_bytes, speed_bytes_per_sec, eta_seconds: progress_events.append(
+                        (downloaded_bytes, total_bytes, speed_bytes_per_sec, eta_seconds)
+                    ),
+                )
+
+        self.assertEqual(output_path.read_bytes(), body)
+        self.assertTrue(any(request.startswith("HEAD ") for request in requests))
+        range_requests = [request for request in requests if request.startswith("GET ") and "Range: bytes=" in request]
+        range_headers = {
+            next(line for line in request.split("\r\n") if line.startswith("Range: "))
+            for request in range_requests
+        }
+        self.assertEqual(range_headers, {"Range: bytes=0-3", "Range: bytes=4-7", "Range: bytes=8-9"})
+        self.assertEqual(progress_events[-1][0], 10)
+        self.assertEqual(progress_events[-1][1], 10)
+
+    def test_media_downloader_falls_back_when_ranges_are_not_supported(self) -> None:
+        body = b"single-path"
+        requests: list[str] = []
+
+        class FakeSocket:
+            def __init__(self) -> None:
+                self._chunks: list[bytes] = []
+
+            def sendall(self, data: bytes) -> None:
+                request = data.decode("ascii")
+                requests.append(request)
+                if request.startswith("HEAD "):
+                    self._chunks = [
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n",
+                        b"",
+                    ]
+                    return
+                self._chunks = [
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n" + body,
+                    b"",
+                ]
+
+            def recv(self, _: int) -> bytes:
+                return self._chunks.pop(0) if self._chunks else b""
+
+            def settimeout(self, timeout: int) -> None:
+                self.timeout = timeout
+
+            def __enter__(self) -> "FakeSocket":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        output_path = self.container.settings.artifacts_dir / "fallback.part"
+        downloader = MediaDownloader(max_bytes=100, max_connections=3, segment_min_bytes=1, segment_size_bytes=4)
+        with patch("app.services.media_downloader.socket.create_connection", side_effect=lambda address, timeout: FakeSocket()):
+            with patch.object(ssl.SSLContext, "wrap_socket", side_effect=lambda sock, server_hostname: sock):
+                downloader.download(
+                    url="https://video.twimg.com/media/clip.mp4",
+                    allowed_addresses=("8.8.8.8",),
+                    output_path=output_path,
+                    timeout_seconds=5,
+                )
+
+        self.assertEqual(output_path.read_bytes(), body)
+        self.assertEqual(sum(1 for request in requests if request.startswith("HEAD ")), 1)
+        self.assertEqual(sum(1 for request in requests if request.startswith("GET ")), 1)
+        self.assertFalse(any("Range: bytes=" in request for request in requests))
 
     def test_worker_uses_extraction_normalized_source_url(self) -> None:
         device = DeviceRepository(self.container.database).create(

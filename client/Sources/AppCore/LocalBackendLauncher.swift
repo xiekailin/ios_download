@@ -353,6 +353,9 @@ public struct LocalBackendLauncher: Sendable {
         environment["XDL_FFMPEG_THREADS"] = currentEnvironment["XDL_FFMPEG_THREADS"] ?? "0"
         environment["XDL_YTDLP_EXTERNAL_DOWNLOADER"] = currentEnvironment["XDL_YTDLP_EXTERNAL_DOWNLOADER"] ?? "auto"
         environment["XDL_YTDLP_EXTERNAL_DOWNLOADER_ARGS"] = currentEnvironment["XDL_YTDLP_EXTERNAL_DOWNLOADER_ARGS"] ?? "aria2c:-x 8 -s 8 -k 1M"
+        environment["XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS"] = currentEnvironment["XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS"] ?? "4"
+        environment["XDL_DIRECT_DOWNLOAD_SEGMENT_MIN_BYTES"] = currentEnvironment["XDL_DIRECT_DOWNLOAD_SEGMENT_MIN_BYTES"] ?? "8388608"
+        environment["XDL_DIRECT_DOWNLOAD_SEGMENT_SIZE"] = currentEnvironment["XDL_DIRECT_DOWNLOAD_SEGMENT_SIZE"] ?? "4194304"
         environment["XDL_YOUTUBE_COOKIES_FROM_BROWSER"] = "chrome"
         environment["XDL_YOUTUBE_REMOTE_COMPONENTS"] = "ejs:github"
         if let demucsPythonURL = demucsPythonURL(supportDirectory: supportDirectory) {
