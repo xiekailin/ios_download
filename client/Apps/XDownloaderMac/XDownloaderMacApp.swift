@@ -1168,9 +1168,7 @@ struct XDownloaderMacApp: App {
             .frame(minWidth: 900, minHeight: 560)
             .toolbar {
                 ToolbarItemGroup(placement: .primaryAction) {
-                    Button {
-                        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-                    } label: {
+                    SettingsLink {
                         Label("设置", systemImage: "gearshape")
                             .labelStyle(.iconOnly)
                     }
