@@ -693,6 +693,7 @@ public enum ArtifactDownloadEvent: Sendable, Equatable {
 }
 
 public enum DownloadPerformanceMode: String, Codable, CaseIterable, Identifiable, Sendable {
+    case automatic
     case lowPower
     case balanced
     case performance
@@ -701,6 +702,8 @@ public enum DownloadPerformanceMode: String, Codable, CaseIterable, Identifiable
 
     public var backendValue: String {
         switch self {
+        case .automatic:
+            "auto"
         case .lowPower:
             "low_power"
         case .balanced:
@@ -712,6 +715,8 @@ public enum DownloadPerformanceMode: String, Codable, CaseIterable, Identifiable
 
     public var title: String {
         switch self {
+        case .automatic:
+            "自动"
         case .lowPower:
             "省电"
         case .balanced:
@@ -747,6 +752,8 @@ public struct DownloadPerformanceSettings: Codable, Sendable, Equatable {
 
     public static func defaults(for mode: DownloadPerformanceMode) -> DownloadPerformanceSettings {
         switch mode {
+        case .automatic:
+            automaticDefaultsForCurrentDevice()
         case .lowPower:
             DownloadPerformanceSettings(
                 performanceMode: .lowPower,
@@ -772,6 +779,49 @@ public struct DownloadPerformanceSettings: Codable, Sendable, Equatable {
                 downloadRateLimit: ""
             )
         }
+    }
+
+    public static func automaticDefaults(
+        activeProcessorCount: Int,
+        isLowPowerModeEnabled: Bool,
+        isThermallyConstrained: Bool
+    ) -> DownloadPerformanceSettings {
+        let baseMode: DownloadPerformanceMode
+        if isLowPowerModeEnabled || isThermallyConstrained {
+            baseMode = .lowPower
+        } else if activeProcessorCount >= 8 {
+            baseMode = .performance
+        } else {
+            baseMode = .balanced
+        }
+        var settings = defaults(for: baseMode)
+        settings.performanceMode = .automatic
+        return settings
+    }
+
+    public static func automaticDefaultsForCurrentDevice() -> DownloadPerformanceSettings {
+        let processInfo = ProcessInfo.processInfo
+        let isThermallyConstrained: Bool
+        switch processInfo.thermalState {
+        case .serious, .critical:
+            isThermallyConstrained = true
+        case .nominal, .fair:
+            isThermallyConstrained = false
+        @unknown default:
+            isThermallyConstrained = false
+        }
+        return automaticDefaults(
+            activeProcessorCount: processInfo.activeProcessorCount,
+            isLowPowerModeEnabled: processInfo.isLowPowerModeEnabled,
+            isThermallyConstrained: isThermallyConstrained
+        )
+    }
+
+    public func resolvedForCurrentDevice() -> DownloadPerformanceSettings {
+        guard performanceMode == .automatic else { return self }
+        var settings = Self.automaticDefaultsForCurrentDevice()
+        settings.downloadRateLimit = downloadRateLimit
+        return settings
     }
 
     public init(

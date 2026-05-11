@@ -127,6 +127,21 @@ class AppTests(unittest.TestCase):
         self.assertEqual(settings.download_worker_max_jobs, 4)
         self.assertEqual(settings.audio_separation_worker_max_jobs, 1)
 
+    def test_auto_performance_mode_uses_machine_capacity(self) -> None:
+        os.environ["XDL_PERFORMANCE_MODE"] = "auto"
+        os.environ.pop("XDL_WORKER_MAX_JOBS", None)
+        os.environ.pop("XDL_DOWNLOAD_WORKER_MAX_JOBS", None)
+        os.environ.pop("XDL_YTDLP_CONCURRENT_FRAGMENTS", None)
+        os.environ.pop("XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS", None)
+
+        with patch("os.cpu_count", return_value=10):
+            settings = Settings.from_env()
+
+        self.assertEqual(settings.performance_mode, "auto")
+        self.assertEqual(settings.download_worker_max_jobs, 4)
+        self.assertEqual(settings.ytdlp_concurrent_fragments, 8)
+        self.assertEqual(settings.direct_download_max_connections, 8)
+
     def test_low_power_mode_keeps_downloads_serial(self) -> None:
         os.environ["XDL_PERFORMANCE_MODE"] = "low_power"
         os.environ.pop("XDL_WORKER_MAX_JOBS", None)

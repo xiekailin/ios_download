@@ -733,6 +733,21 @@ struct LocalBackendLauncherTests {
     #expect(environment["XDL_DIRECT_DOWNLOAD_SEGMENT_SIZE"] == "4194304")
 }
 
+@Test func localBackendLauncherResolvesAutomaticPerformanceSettings() {
+    let performance = DownloadPerformanceSettings.automaticDefaults(
+        activeProcessorCount: 10,
+        isLowPowerModeEnabled: false,
+        isThermallyConstrained: false
+    )
+
+    let environment = LocalBackendLauncher.defaultEnvironment(performanceSettings: performance)
+
+    #expect(environment["XDL_PERFORMANCE_MODE"] == "auto")
+    #expect(environment["XDL_DOWNLOAD_WORKER_MAX_JOBS"] == "4")
+    #expect(environment["XDL_YTDLP_CONCURRENT_FRAGMENTS"] == "8")
+    #expect(environment["XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS"] == "8")
+}
+
 @Test func localBackendLauncherAppliesCustomDownloadPerformanceSettings() {
     let performance = DownloadPerformanceSettings(
         performanceMode: .performance,

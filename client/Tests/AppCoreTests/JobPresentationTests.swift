@@ -285,11 +285,27 @@ private func makePresentationJob(
 
 @Test func downloadPerformanceModePresetsTuneBackendValues() {
     let lowPower = DownloadPerformanceSettings.defaults(for: .lowPower)
+    let automaticLowPower = DownloadPerformanceSettings.automaticDefaults(
+        activeProcessorCount: 10,
+        isLowPowerModeEnabled: true,
+        isThermallyConstrained: false
+    )
+    let automaticFast = DownloadPerformanceSettings.automaticDefaults(
+        activeProcessorCount: 10,
+        isLowPowerModeEnabled: false,
+        isThermallyConstrained: false
+    )
     let performance = DownloadPerformanceSettings.defaults(for: .performance)
 
     #expect(lowPower.simultaneousDownloadJobs == 1)
     #expect(lowPower.directDownloadMaxConnectionsForBackend == 1)
     #expect(lowPower.ytdlpConcurrentFragments == 1)
+    #expect(automaticLowPower.performanceMode == .automatic)
+    #expect(automaticLowPower.simultaneousDownloadJobs == 1)
+    #expect(automaticFast.performanceMode == .automatic)
+    #expect(automaticFast.simultaneousDownloadJobs == 4)
+    #expect(automaticFast.directDownloadMaxConnectionsForBackend == 8)
+    #expect(automaticFast.ytdlpConcurrentFragments == 8)
     #expect(performance.simultaneousDownloadJobs == 4)
     #expect(performance.directDownloadMaxConnectionsForBackend == 8)
     #expect(performance.ytdlpConcurrentFragments == 8)

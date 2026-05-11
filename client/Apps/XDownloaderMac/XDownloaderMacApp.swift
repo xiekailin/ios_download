@@ -157,8 +157,9 @@ struct XDownloaderMacApp: App {
     }
 
     private func makeLocalBackendLauncher() -> LocalBackendLauncher {
-        LocalBackendLauncher(
-            environment: LocalBackendLauncher.defaultEnvironment(performanceSettings: store.settings.downloadPerformance),
+        let performanceSettings = store.settings.downloadPerformance.resolvedForCurrentDevice()
+        return LocalBackendLauncher(
+            environment: LocalBackendLauncher.defaultEnvironment(performanceSettings: performanceSettings),
             localSecret: store.settings.localBackendSecret
         )
     }
@@ -1323,6 +1324,7 @@ private struct MacDownloadPerformanceSettingsView: View {
     private let fragmentOptions = [1, 4, 8, 16]
     private let segmentSizeOptions = [4 * 1024 * 1024, 8 * 1024 * 1024, 16 * 1024 * 1024]
     private let ffmpegThreadOptions = [0, 1, 2, 4, 8]
+    private var usesAutomaticPerformance: Bool { performance.performanceMode == .automatic }
 
     var body: some View {
         Form {
@@ -1337,39 +1339,49 @@ private struct MacDownloadPerformanceSettingsView: View {
                     performance = DownloadPerformanceSettings.defaults(for: mode)
                 }
 
+                if usesAutomaticPerformance {
+                    Text("自动会在每次应用配置时根据低电量模式、系统温度和 CPU 核心数选择资源档位。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
                 Picker("同时下载任务", selection: $performance.simultaneousDownloadJobs) {
                     ForEach(jobOptions, id: \.self) { value in
                         Text("\(value)").tag(value)
                     }
                 }
+                .disabled(usesAutomaticPerformance)
 
                 Toggle("直连分片下载", isOn: $performance.directDownloadAccelerationEnabled)
+                    .disabled(usesAutomaticPerformance)
 
                 Picker("直连连接数", selection: $performance.directDownloadMaxConnections) {
                     ForEach(connectionOptions, id: \.self) { value in
                         Text("\(value)").tag(value)
                     }
                 }
-                .disabled(!performance.directDownloadAccelerationEnabled)
+                .disabled(usesAutomaticPerformance || !performance.directDownloadAccelerationEnabled)
 
                 Picker("分片大小", selection: $performance.directDownloadSegmentSizeBytes) {
                     ForEach(segmentSizeOptions, id: \.self) { value in
                         Text(byteSizeTitle(value)).tag(value)
                     }
                 }
-                .disabled(!performance.directDownloadAccelerationEnabled)
+                .disabled(usesAutomaticPerformance || !performance.directDownloadAccelerationEnabled)
 
                 Picker("yt-dlp 分片", selection: $performance.ytdlpConcurrentFragments) {
                     ForEach(fragmentOptions, id: \.self) { value in
                         Text("\(value)").tag(value)
                     }
                 }
+                .disabled(usesAutomaticPerformance)
 
                 Picker("合并与转码线程", selection: $performance.ffmpegThreadCount) {
                     ForEach(ffmpegThreadOptions, id: \.self) { value in
                         Text(value == 0 ? "自动" : "\(value)").tag(value)
                     }
                 }
+                .disabled(usesAutomaticPerformance)
 
                 TextField("速度限制", text: $performance.downloadRateLimit, prompt: Text("不限"))
                     .textFieldStyle(.roundedBorder)

@@ -60,6 +60,8 @@ def _get_nonnegative_int_env(name: str, default: int) -> int:
 def _get_performance_mode_env() -> str:
     raw = os.getenv("XDL_PERFORMANCE_MODE", "balanced").strip().lower().replace("-", "_")
     aliases = {
+        "automatic": "auto",
+        "smart": "auto",
         "low": "low_power",
         "power_saver": "low_power",
         "normal": "balanced",
@@ -67,9 +69,18 @@ def _get_performance_mode_env() -> str:
         "high_performance": "performance",
     }
     mode = aliases.get(raw, raw)
-    if mode not in {"low_power", "balanced", "performance"}:
+    if mode not in {"auto", "low_power", "balanced", "performance"}:
         raise ValidationAppError("invalid performance mode", "环境变量 XDL_PERFORMANCE_MODE 配置不正确。")
     return mode
+
+
+def _effective_performance_mode(mode: str) -> str:
+    if mode != "auto":
+        return mode
+    cpu_count = os.cpu_count() or 4
+    if cpu_count >= 8:
+        return "performance"
+    return "balanced"
 
 
 def _get_ytdlp_format_strategy_env() -> str:
@@ -227,9 +238,10 @@ class Settings:
         if cloud_mode and not bootstrap_code:
             raise ValueError("XDL_BOOTSTRAP_CODE is required when XDL_CLOUD_MODE is true")
         performance_mode = _get_performance_mode_env()
-        download_default, audio_separation_default = _performance_worker_defaults(performance_mode)
-        fragment_default = _performance_fragment_defaults(performance_mode)
-        direct_download_default = _performance_direct_download_defaults(performance_mode)
+        effective_performance_mode = _effective_performance_mode(performance_mode)
+        download_default, audio_separation_default = _performance_worker_defaults(effective_performance_mode)
+        fragment_default = _performance_fragment_defaults(effective_performance_mode)
+        direct_download_default = _performance_direct_download_defaults(effective_performance_mode)
         worker_max_jobs = _get_positive_int_env("XDL_WORKER_MAX_JOBS", download_default)
         return cls(
             app_name=os.getenv("XDL_APP_NAME", "X Downloader API"),
