@@ -62,6 +62,7 @@ private func makePresentationJob(
     #expect(job.failureRecoveryAdvice?.title == "平台正在限流")
     #expect(job.failureRecoveryAdvice?.detail.contains("稍后") == true)
     #expect(job.failureRecoveryAdvice?.actionTitle == "稍后重试")
+    #expect(job.failureRecoveryAdvice?.action == .retry)
 }
 
 @Test func failedJobRecoveryAdviceClassifiesLoginVerification() {
@@ -69,7 +70,8 @@ private func makePresentationJob(
 
     #expect(job.failureRecoveryAdvice?.title == "需要登录验证")
     #expect(job.failureRecoveryAdvice?.detail.contains("Cookie") == true)
-    #expect(job.failureRecoveryAdvice?.actionTitle == "配置 Cookie 后重试")
+    #expect(job.failureRecoveryAdvice?.actionTitle == "选择 Cookie 并重试")
+    #expect(job.failureRecoveryAdvice?.action == .uploadCookiesAndRetry)
 }
 
 @Test func failedJobRecoveryAdviceClassifiesDiskSpace() {
@@ -77,7 +79,15 @@ private func makePresentationJob(
 
     #expect(job.failureRecoveryAdvice?.title == "磁盘空间不足")
     #expect(job.failureRecoveryAdvice?.detail.contains("释放") == true)
-    #expect(job.failureRecoveryAdvice?.actionTitle == "清理空间后重试")
+    #expect(job.failureRecoveryAdvice?.actionTitle == "打开下载目录")
+    #expect(job.failureRecoveryAdvice?.action == .openDownloadsFolder)
+}
+
+@Test func failedJobRecoveryAdviceClassifiesNetworkRecovery() {
+    let job = makePresentationJob(status: .failed, errorMessage: "connection reset by peer")
+
+    #expect(job.failureRecoveryAdvice?.title == "网络连接不稳定")
+    #expect(job.failureRecoveryAdvice?.action == .recheckBackendAndRetry)
 }
 
 @Test func activeJobDoesNotShowRecoveryAdvice() {

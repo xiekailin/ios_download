@@ -298,15 +298,25 @@ public struct BatchSubmissionResult: Sendable, Equatable {
     }
 }
 
+public enum FailureRecoveryAction: String, Sendable, Equatable {
+    case retry
+    case uploadCookiesAndRetry
+    case recheckBackendAndRetry
+    case openDownloadsFolder
+    case inspectLogs
+}
+
 public struct FailureRecoveryAdvice: Sendable, Equatable {
     public let title: String
     public let detail: String
     public let actionTitle: String
+    public let action: FailureRecoveryAction
 
-    public init(title: String, detail: String, actionTitle: String) {
+    public init(title: String, detail: String, actionTitle: String, action: FailureRecoveryAction) {
         self.title = title
         self.detail = detail
         self.actionTitle = actionTitle
+        self.action = action
     }
 }
 
@@ -516,7 +526,8 @@ public struct Job: Codable, Identifiable, Sendable, Equatable {
             return FailureRecoveryAdvice(
                 title: "需要登录验证",
                 detail: "平台要求登录或真人验证，请在设置里更新有效 Cookie 后重试。",
-                actionTitle: "配置 Cookie 后重试"
+                actionTitle: "选择 Cookie 并重试",
+                action: .uploadCookiesAndRetry
             )
         }
 
@@ -530,7 +541,8 @@ public struct Job: Codable, Identifiable, Sendable, Equatable {
             return FailureRecoveryAdvice(
                 title: "平台正在限流",
                 detail: "自动模式会尝试降速重试；如果仍失败，建议稍后再试或切换到更保守的性能模式。",
-                actionTitle: "稍后重试"
+                actionTitle: "稍后重试",
+                action: .retry
             )
         }
 
@@ -544,7 +556,8 @@ public struct Job: Codable, Identifiable, Sendable, Equatable {
             return FailureRecoveryAdvice(
                 title: "磁盘空间不足",
                 detail: "本地保存或合并文件时空间不够，请释放下载目录所在磁盘空间后重试。",
-                actionTitle: "清理空间后重试"
+                actionTitle: "打开下载目录",
+                action: .openDownloadsFolder
             )
         }
 
@@ -561,7 +574,8 @@ public struct Job: Codable, Identifiable, Sendable, Equatable {
             return FailureRecoveryAdvice(
                 title: "网络连接不稳定",
                 detail: "当前网络或平台响应不稳定，请保持后端运行并稍后重试。",
-                actionTitle: "重新检测后重试"
+                actionTitle: "检测并重试",
+                action: .recheckBackendAndRetry
             )
         }
 
@@ -574,7 +588,8 @@ public struct Job: Codable, Identifiable, Sendable, Equatable {
             return FailureRecoveryAdvice(
                 title: "视频格式不可用",
                 detail: "平台暂时没有提供可下载格式，可以换一个清晰度或稍后重试。",
-                actionTitle: "调整清晰度后重试"
+                actionTitle: "重试任务",
+                action: .retry
             )
         }
 
@@ -592,7 +607,8 @@ public struct Job: Codable, Identifiable, Sendable, Equatable {
             return FailureRecoveryAdvice(
                 title: "素材不可访问",
                 detail: "原链接可能已删除、设为私密或需要账号权限，请确认链接可在浏览器中正常打开。",
-                actionTitle: "检查链接后重试"
+                actionTitle: "查看日志",
+                action: .inspectLogs
             )
         }
 
@@ -608,14 +624,16 @@ public struct Job: Codable, Identifiable, Sendable, Equatable {
             return FailureRecoveryAdvice(
                 title: "合并处理失败",
                 detail: "下载已到后处理阶段但合并失败，请确认 FFmpeg 可用并重试。",
-                actionTitle: "检查依赖后重试"
+                actionTitle: "重试任务",
+                action: .retry
             )
         }
 
         return FailureRecoveryAdvice(
             title: "建议重试",
             detail: "可以直接重试任务；如果连续失败，请打开日志查看最后一条错误。",
-            actionTitle: "重试任务"
+            actionTitle: "重试任务",
+            action: .retry
         )
     }
 

@@ -70,6 +70,7 @@ struct XDownloaderMacApp: App {
     @State private var isLogSectionExpanded = false
     @State private var settingsSaveMessage: String?
     @State private var isRestartingBackend = false
+    @State private var activeFailureRecoveryJobID: Job.ID?
     private static let localSettings = makeLocalSettings()
     private static let localSecret = localSettings.localBackendSecret
     private static let localBaseURL = URL(string: "http://127.0.0.1:18767")!
@@ -590,7 +591,7 @@ struct XDownloaderMacApp: App {
         .padding(.vertical, 12)
     }
 
-    private func failureRecoveryAdviceCard(_ advice: FailureRecoveryAdvice) -> some View {
+    private func failureRecoveryAdviceCard(_ advice: FailureRecoveryAdvice, for job: Job) -> some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: "wrench.and.screwdriver.fill")
                 .font(.system(size: 14, weight: .semibold))
@@ -609,11 +610,19 @@ struct XDownloaderMacApp: App {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                Label(advice.actionTitle, systemImage: "arrow.clockwise")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.red)
-                    .labelStyle(.titleAndIcon)
-                    .padding(.top, 2)
+                Button {
+                    performFailureRecovery(advice, for: job)
+                } label: {
+                    if activeFailureRecoveryJobID == job.id {
+                        Label("处理中…", systemImage: "clock")
+                    } else {
+                        Label(advice.actionTitle, systemImage: recoveryActionSystemImage(advice.action))
+                    }
+                }
+                .controlSize(.small)
+                .buttonStyle(.bordered)
+                .disabled(store.isLoading || retryingJobID != nil || activeFailureRecoveryJobID != nil)
+                .padding(.top, 2)
             }
         }
         .padding(10)
@@ -884,21 +893,117 @@ struct XDownloaderMacApp: App {
         }
     }
 
+    private func retryFailedJob(_ job: Job, marksRecovery: Bool = false) {
+        guard retryingJobID == nil, !store.isLoading else { return }
+        retryingJobID = job.id
+        if marksRecovery {
+            activeFailureRecoveryJobID = job.id
+        }
+        resetArtifactState()
+        Task {
+            await controller.retryJob(id: job.id, store: store)
+            retryingJobID = nil
+            if marksRecovery {
+                activeFailureRecoveryJobID = nil
+            }
+        }
+    }
+
+    private func performFailureRecovery(_ advice: FailureRecoveryAdvice, for job: Job) {
+        switch advice.action {
+        case .retry:
+            retryFailedJob(job, marksRecovery: true)
+        case .uploadCookiesAndRetry:
+            selectCookieFileAndRetry(job)
+        case .recheckBackendAndRetry:
+            recheckBackendAndRetry(job)
+        case .openDownloadsFolder:
+            openDownloadsFolderForRecovery(job)
+        case .inspectLogs:
+            isLogSectionExpanded = true
+            Task { await loadJobLogs(for: job) }
+        }
+    }
+
+    private func selectCookieFileAndRetry(_ job: Job) {
+        guard activeFailureRecoveryJobID == nil, !store.isLoading else { return }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [UTType.plainText, UTType(filenameExtension: "txt")].compactMap { $0 }
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.message = "选择平台导出的 cookies.txt"
+        if panel.runModal() == .OK, let url = panel.url {
+            activeFailureRecoveryJobID = job.id
+            resetArtifactState()
+            Task {
+                let didStartAccessing = url.startAccessingSecurityScopedResource()
+                defer {
+                    if didStartAccessing {
+                        url.stopAccessingSecurityScopedResource()
+                    }
+                    activeFailureRecoveryJobID = nil
+                }
+                if let status = await controller.uploadYouTubeCookies(fileURL: url, store: store), status.isConfigured {
+                    await controller.retryJob(id: job.id, store: store)
+                }
+            }
+        }
+    }
+
+    private func recheckBackendAndRetry(_ job: Job) {
+        guard activeFailureRecoveryJobID == nil, !store.isLoading else { return }
+        activeFailureRecoveryJobID = job.id
+        resetArtifactState()
+        Task {
+            await refreshBackendHealth(startIfNeeded: true)
+            if store.backendHealthStatus == .healthy {
+                await controller.retryJob(id: job.id, store: store)
+            }
+            activeFailureRecoveryJobID = nil
+        }
+    }
+
+    private func openDownloadsFolderForRecovery(_ job: Job) {
+        guard activeFailureRecoveryJobID == nil else { return }
+        activeFailureRecoveryJobID = job.id
+        defer { activeFailureRecoveryJobID = nil }
+        do {
+            let directory = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+                .appending(path: "XDownloader", directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            NSWorkspace.shared.activateFileViewerSelecting([directory])
+            store.setError(nil)
+        } catch {
+            store.setError("打开下载目录失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func recoveryActionSystemImage(_ action: FailureRecoveryAction) -> String {
+        switch action {
+        case .retry:
+            "arrow.clockwise"
+        case .uploadCookiesAndRetry:
+            "key.fill"
+        case .recheckBackendAndRetry:
+            "network"
+        case .openDownloadsFolder:
+            "folder"
+        case .inspectLogs:
+            "list.bullet.rectangle"
+        }
+    }
+
     private func terminalJobActions(for job: Job) -> some View {
         HStack(spacing: 8) {
             if job.status == .failed || job.status == .canceled {
                 Button {
-                    retryingJobID = job.id
-                    resetArtifactState()
-                    Task {
-                        await controller.retryJob(id: job.id, store: store)
-                        retryingJobID = nil
-                    }
+                    retryFailedJob(job)
                 } label: {
                     Label(retryingJobID == job.id ? "正在重试…" : "重试任务", systemImage: "arrow.clockwise")
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(store.isLoading || retryingJobID != nil)
+                .disabled(store.isLoading || retryingJobID != nil || activeFailureRecoveryJobID != nil)
             }
 
             Button(role: .destructive, action: {
@@ -1124,7 +1229,7 @@ struct XDownloaderMacApp: App {
             if let advice = job.failureRecoveryAdvice {
                 Divider()
                 inspectorSection("诊断建议", systemImage: "stethoscope") {
-                    failureRecoveryAdviceCard(advice)
+                    failureRecoveryAdviceCard(advice, for: job)
                 }
             }
 
