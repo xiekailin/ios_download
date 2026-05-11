@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import os
 import signal
@@ -3178,6 +3179,234 @@ class AppTests(unittest.TestCase):
         self.assertEqual(range_headers, {"Range: bytes=0-3", "Range: bytes=4-7", "Range: bytes=8-9"})
         self.assertEqual(progress_events[-1][0], 10)
         self.assertEqual(progress_events[-1][1], 10)
+
+    def test_media_downloader_resumes_completed_range_segments_from_manifest(self) -> None:
+        body = b"0123456789"
+        requests: list[str] = []
+        progress_events: list[tuple[int, int | None, int | None, int | None]] = []
+
+        class FakeSocket:
+            def __init__(self) -> None:
+                self._chunks: list[bytes] = []
+
+            def sendall(self, data: bytes) -> None:
+                request = data.decode("ascii")
+                requests.append(request)
+                if request.startswith("HEAD "):
+                    self._chunks = [
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nAccept-Ranges: bytes\r\n\r\n",
+                        b"",
+                    ]
+                    return
+                range_line = next(line for line in request.split("\r\n") if line.startswith("Range: "))
+                start_text, end_text = range_line.removeprefix("Range: bytes=").split("-")
+                start = int(start_text)
+                end = int(end_text)
+                chunk = body[start : end + 1]
+                response = (
+                    f"HTTP/1.1 206 Partial Content\r\n"
+                    f"Content-Length: {len(chunk)}\r\n"
+                    f"Content-Range: bytes {start}-{end}/{len(body)}\r\n"
+                    "\r\n"
+                ).encode("ascii")
+                self._chunks = [response + chunk, b""]
+
+            def recv(self, _: int) -> bytes:
+                return self._chunks.pop(0) if self._chunks else b""
+
+            def settimeout(self, timeout: int) -> None:
+                self.timeout = timeout
+
+            def __enter__(self) -> "FakeSocket":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        output_path = self.container.settings.artifacts_dir / "segmented-resume.part"
+        manifest_path = output_path.with_name(f"{output_path.name}.segments.json")
+        first_part_path = output_path.with_name(f"{output_path.name}.segment-0")
+        first_part_path.write_bytes(body[:4])
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "resource": "video.twimg.com/media/clip.mp4",
+                    "total_bytes": 10,
+                    "segments": [
+                        {"index": 0, "start": 0, "end": 3, "length": 4},
+                        {"index": 1, "start": 4, "end": 7, "length": 4},
+                        {"index": 2, "start": 8, "end": 9, "length": 2},
+                    ],
+                    "created_at": 1,
+                    "updated_at": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        downloader = MediaDownloader(max_bytes=100, max_connections=3, segment_min_bytes=1, segment_size_bytes=4)
+        with patch("app.services.media_downloader.socket.create_connection", side_effect=lambda address, timeout: FakeSocket()):
+            with patch.object(ssl.SSLContext, "wrap_socket", side_effect=lambda sock, server_hostname: sock):
+                downloader.download(
+                    url="https://video.twimg.com/media/clip.mp4",
+                    allowed_addresses=("8.8.8.8",),
+                    output_path=output_path,
+                    timeout_seconds=5,
+                    progress_callback=lambda downloaded_bytes, total_bytes, speed_bytes_per_sec, eta_seconds: progress_events.append(
+                        (downloaded_bytes, total_bytes, speed_bytes_per_sec, eta_seconds)
+                    ),
+                )
+
+        self.assertEqual(output_path.read_bytes(), body)
+        range_requests = [request for request in requests if request.startswith("GET ") and "Range: bytes=" in request]
+        range_headers = {
+            next(line for line in request.split("\r\n") if line.startswith("Range: "))
+            for request in range_requests
+        }
+        self.assertEqual(range_headers, {"Range: bytes=4-7", "Range: bytes=8-9"})
+        self.assertEqual(progress_events[-1][0], 10)
+        self.assertFalse(manifest_path.exists())
+        self.assertFalse(first_part_path.exists())
+        self.assertFalse(output_path.with_name(f"{output_path.name}.segment-1").exists())
+        self.assertFalse(output_path.with_name(f"{output_path.name}.segment-2").exists())
+
+    def test_media_downloader_preserves_range_segments_after_failure(self) -> None:
+        body = b"01234567"
+        requests: list[str] = []
+
+        class FakeSocket:
+            def __init__(self) -> None:
+                self._chunks: list[bytes] = []
+
+            def sendall(self, data: bytes) -> None:
+                request = data.decode("ascii")
+                requests.append(request)
+                if request.startswith("HEAD "):
+                    self._chunks = [
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nAccept-Ranges: bytes\r\n\r\n",
+                        b"",
+                    ]
+                    return
+                if "Range: bytes=" not in request:
+                    self._chunks = [b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n", b""]
+                    return
+                range_line = next(line for line in request.split("\r\n") if line.startswith("Range: "))
+                start_text, end_text = range_line.removeprefix("Range: bytes=").split("-")
+                start = int(start_text)
+                end = int(end_text)
+                if start == 4:
+                    self._chunks = [b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n", b""]
+                    return
+                chunk = body[start : end + 1]
+                response = (
+                    f"HTTP/1.1 206 Partial Content\r\n"
+                    f"Content-Length: {len(chunk)}\r\n"
+                    f"Content-Range: bytes {start}-{end}/{len(body)}\r\n"
+                    "\r\n"
+                ).encode("ascii")
+                self._chunks = [response + chunk, b""]
+
+            def recv(self, _: int) -> bytes:
+                return self._chunks.pop(0) if self._chunks else b""
+
+            def settimeout(self, timeout: int) -> None:
+                self.timeout = timeout
+
+            def __enter__(self) -> "FakeSocket":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        output_path = self.container.settings.artifacts_dir / "segmented-failure.part"
+        downloader = MediaDownloader(max_bytes=100, max_connections=2, segment_min_bytes=1, segment_size_bytes=4)
+        with patch("app.services.media_downloader.socket.create_connection", side_effect=lambda address, timeout: FakeSocket()):
+            with patch.object(ssl.SSLContext, "wrap_socket", side_effect=lambda sock, server_hostname: sock):
+                with self.assertRaises(DownloadAppError):
+                    downloader.download(
+                        url="https://video.twimg.com/media/clip.mp4",
+                        allowed_addresses=("8.8.8.8",),
+                        output_path=output_path,
+                        timeout_seconds=5,
+                    )
+
+        self.assertFalse(output_path.exists())
+        self.assertTrue(output_path.with_name(f"{output_path.name}.segments.json").exists())
+        self.assertEqual(output_path.with_name(f"{output_path.name}.segment-0").read_bytes(), body[:4])
+        self.assertFalse(output_path.with_name(f"{output_path.name}.segment-1").exists())
+        self.assertIn("Range: bytes=0-3", "\n".join(requests))
+        self.assertIn("Range: bytes=4-7", "\n".join(requests))
+
+    def test_media_downloader_falls_back_to_single_get_when_range_strategy_fails(self) -> None:
+        body = b"01234567"
+        requests: list[str] = []
+
+        class FakeSocket:
+            def __init__(self) -> None:
+                self._chunks: list[bytes] = []
+
+            def sendall(self, data: bytes) -> None:
+                request = data.decode("ascii")
+                requests.append(request)
+                if request.startswith("HEAD "):
+                    self._chunks = [
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nAccept-Ranges: bytes\r\n\r\n",
+                        b"",
+                    ]
+                    return
+                if "Range: bytes=" not in request:
+                    self._chunks = [
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n" + body,
+                        b"",
+                    ]
+                    return
+                range_line = next(line for line in request.split("\r\n") if line.startswith("Range: "))
+                start_text, end_text = range_line.removeprefix("Range: bytes=").split("-")
+                start = int(start_text)
+                end = int(end_text)
+                if start == 4:
+                    self._chunks = [b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n", b""]
+                    return
+                chunk = body[start : end + 1]
+                response = (
+                    f"HTTP/1.1 206 Partial Content\r\n"
+                    f"Content-Length: {len(chunk)}\r\n"
+                    f"Content-Range: bytes {start}-{end}/{len(body)}\r\n"
+                    "\r\n"
+                ).encode("ascii")
+                self._chunks = [response + chunk, b""]
+
+            def recv(self, _: int) -> bytes:
+                return self._chunks.pop(0) if self._chunks else b""
+
+            def settimeout(self, timeout: int) -> None:
+                self.timeout = timeout
+
+            def __enter__(self) -> "FakeSocket":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        output_path = self.container.settings.artifacts_dir / "segmented-fallback.part"
+        downloader = MediaDownloader(max_bytes=100, max_connections=2, segment_min_bytes=1, segment_size_bytes=4)
+        with patch("app.services.media_downloader.socket.create_connection", side_effect=lambda address, timeout: FakeSocket()):
+            with patch.object(ssl.SSLContext, "wrap_socket", side_effect=lambda sock, server_hostname: sock):
+                downloader.download(
+                    url="https://video.twimg.com/media/clip.mp4",
+                    allowed_addresses=("8.8.8.8",),
+                    output_path=output_path,
+                    timeout_seconds=5,
+                )
+
+        self.assertEqual(output_path.read_bytes(), body)
+        self.assertTrue(any(request.startswith("GET ") and "Range: bytes=0-3" in request for request in requests))
+        self.assertTrue(any(request.startswith("GET ") and "Range: bytes=4-7" in request for request in requests))
+        self.assertTrue(any(request.startswith("GET ") and "Range: bytes=" not in request for request in requests))
+        self.assertFalse(output_path.with_name(f"{output_path.name}.segments.json").exists())
+        self.assertFalse(output_path.with_name(f"{output_path.name}.segment-0").exists())
+        self.assertFalse(output_path.with_name(f"{output_path.name}.segment-1").exists())
 
     def test_media_downloader_falls_back_when_ranges_are_not_supported(self) -> None:
         body = b"single-path"

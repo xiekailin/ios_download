@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+import json
 import math
 import os
 from ipaddress import ip_address
@@ -19,6 +20,7 @@ from app.core.errors import DownloadAppError
 _CHUNK_SIZE = 1024 * 1024
 _MAX_HEADER_BYTES = 16 * 1024
 _MAX_LINE_BYTES = 4 * 1024
+_SEGMENT_MANIFEST_VERSION = 1
 
 ProgressCallback = Callable[[int, int | None, int | None, int | None], None]
 
@@ -37,6 +39,8 @@ class _Segment:
 @dataclass(frozen=True, slots=True)
 class _RangeProbe:
     total_bytes: int
+    etag: str | None = None
+    last_modified: str | None = None
 
 
 @dataclass(slots=True)
@@ -153,25 +157,74 @@ class MediaDownloader:
                 ssl_context=ssl_context,
             )
             if probe is not None:
-                self._download_segmented_from_address(
-                    host=host,
-                    port=port,
-                    path_and_query=path_and_query,
-                    address=address,
-                    output_path=output_path,
-                    timeout_seconds=timeout_seconds,
-                    ssl_context=ssl_context,
-                    total_bytes=probe.total_bytes,
-                    progress_callback=progress_callback,
-                )
-                return
+                try:
+                    self._download_segmented_from_address(
+                        host=host,
+                        port=port,
+                        path_and_query=path_and_query,
+                        address=address,
+                        output_path=output_path,
+                        timeout_seconds=timeout_seconds,
+                        ssl_context=ssl_context,
+                        total_bytes=probe.total_bytes,
+                        etag=probe.etag,
+                        last_modified=probe.last_modified,
+                        progress_callback=progress_callback,
+                    )
+                    return
+                except DownloadAppError as exc:
+                    if not self._should_fallback_to_single_download(exc):
+                        raise
+                    self._download_single_from_address(
+                        host=host,
+                        port=port,
+                        path_and_query=path_and_query,
+                        address=address,
+                        output_path=output_path,
+                        timeout_seconds=timeout_seconds,
+                        ssl_context=ssl_context,
+                        progress_callback=progress_callback,
+                    )
+                    part_paths = [self._segment_part_path(output_path, segment) for segment in self._build_segments(probe.total_bytes)]
+                    self._cleanup_segment_artifacts(part_paths, self._segment_manifest_path(output_path))
+                    return
 
+        self._download_single_from_address(
+            host=host,
+            port=port,
+            path_and_query=path_and_query,
+            address=address,
+            output_path=output_path,
+            timeout_seconds=timeout_seconds,
+            ssl_context=ssl_context,
+            progress_callback=progress_callback,
+        )
+
+    def _download_single_from_address(
+        self,
+        *,
+        host: str,
+        port: int,
+        path_and_query: str,
+        address: str,
+        output_path: Path,
+        timeout_seconds: int,
+        ssl_context: ssl.SSLContext,
+        progress_callback: ProgressCallback | None,
+    ) -> None:
         with socket.create_connection((address, port), timeout=timeout_seconds) as tcp_socket:
             with ssl_context.wrap_socket(tcp_socket, server_hostname=host) as tls_socket:
                 self._send_request(tls_socket, method="GET", host=host, path_and_query=path_and_query)
                 tls_socket.settimeout(timeout_seconds)
                 with self._open_output_file(output_path) as output_file:
                     self._read_response_body(tls_socket, output_file, progress_callback)
+
+    def _should_fallback_to_single_download(self, exc: DownloadAppError) -> bool:
+        return exc.message not in {
+            "temporary download path already exists",
+            "failed to create temporary download file",
+            "media file is too large",
+        }
 
     def _probe_range_support(
         self,
@@ -208,7 +261,11 @@ class MediaDownloader:
             return None
         if headers.get("content-encoding"):
             return None
-        return _RangeProbe(total_bytes=content_length)
+        return _RangeProbe(
+            total_bytes=content_length,
+            etag=headers.get("etag"),
+            last_modified=headers.get("last-modified"),
+        )
 
     def _download_segmented_from_address(
         self,
@@ -221,48 +278,70 @@ class MediaDownloader:
         timeout_seconds: int,
         ssl_context: ssl.SSLContext,
         total_bytes: int,
+        etag: str | None,
+        last_modified: str | None,
         progress_callback: ProgressCallback | None,
     ) -> None:
         if output_path.exists():
             raise DownloadAppError("temporary download path already exists")
 
         segments = self._build_segments(total_bytes)
-        part_paths = [output_path.with_name(f"{output_path.name}.segment-{segment.index}") for segment in segments]
-        for part_path in part_paths:
-            if part_path.exists():
-                raise DownloadAppError("temporary download path already exists")
+        part_paths = [self._segment_part_path(output_path, segment) for segment in segments]
+        manifest_path = self._prepare_segment_manifest(
+            output_path=output_path,
+            resource=f"{host}{path_and_query}",
+            total_bytes=total_bytes,
+            etag=etag,
+            last_modified=last_modified,
+            segments=segments,
+            part_paths=part_paths,
+        )
+        complete_segments = [
+            segment
+            for segment, part_path in zip(segments, part_paths, strict=True)
+            if self._is_complete_segment_file(part_path, segment)
+        ]
+        complete_indexes = {segment.index for segment in complete_segments}
+        pending_segments = [
+            (segment, part_path)
+            for segment, part_path in zip(segments, part_paths, strict=True)
+            if segment.index not in complete_indexes
+        ]
+        resumed_bytes = sum(segment.length for segment in complete_segments)
 
-        tracker = _ProgressTracker(callback=progress_callback, total_bytes=total_bytes)
+        tracker = _ProgressTracker(
+            callback=progress_callback,
+            total_bytes=total_bytes,
+            downloaded_bytes=resumed_bytes,
+        )
         try:
-            with ThreadPoolExecutor(max_workers=min(self._max_connections, len(segments))) as executor:
-                futures = [
-                    executor.submit(
-                        self._download_segment,
-                        host=host,
-                        port=port,
-                        path_and_query=path_and_query,
-                        address=address,
-                        output_path=part_path,
-                        timeout_seconds=timeout_seconds,
-                        ssl_context=ssl_context,
-                        segment=segment,
-                        tracker=tracker,
-                    )
-                    for segment, part_path in zip(segments, part_paths, strict=True)
-                ]
-                for future in as_completed(futures):
-                    future.result()
+            if pending_segments:
+                with ThreadPoolExecutor(max_workers=min(self._max_connections, len(pending_segments))) as executor:
+                    futures = [
+                        executor.submit(
+                            self._download_segment,
+                            host=host,
+                            port=port,
+                            path_and_query=path_and_query,
+                            address=address,
+                            output_path=part_path,
+                            timeout_seconds=timeout_seconds,
+                            ssl_context=ssl_context,
+                            segment=segment,
+                            tracker=tracker,
+                        )
+                        for segment, part_path in pending_segments
+                    ]
+                    for future in as_completed(futures):
+                        future.result()
             self._combine_segments(part_paths, output_path)
+            self._cleanup_segment_artifacts(part_paths, manifest_path)
         except DownloadAppError:
-            self._cleanup_segmented_download(output_path, part_paths)
+            self._cleanup_segmented_output(output_path)
             raise
         except Exception as exc:
-            self._cleanup_segmented_download(output_path, part_paths)
+            self._cleanup_segmented_output(output_path)
             raise DownloadAppError("segmented download failed") from exc
-        finally:
-            for part_path in part_paths:
-                if part_path.exists():
-                    part_path.unlink()
 
     def _download_segment(
         self,
@@ -372,21 +451,137 @@ class MediaDownloader:
         return segments
 
     def _combine_segments(self, part_paths: list[Path], output_path: Path) -> None:
-        with self._open_output_file(output_path) as output_file:
-            for part_path in part_paths:
-                with part_path.open("rb") as part_file:
-                    while True:
-                        chunk = part_file.read(_CHUNK_SIZE)
-                        if not chunk:
-                            break
-                        output_file.write(chunk)
+        merge_path = output_path.with_name(f"{output_path.name}.merge")
+        self._unlink_if_exists(merge_path)
+        try:
+            with self._open_output_file(merge_path) as output_file:
+                for part_path in part_paths:
+                    with part_path.open("rb") as part_file:
+                        while True:
+                            chunk = part_file.read(_CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            output_file.write(chunk)
+            merge_path.replace(output_path)
+        except Exception:
+            self._unlink_if_exists(merge_path)
+            raise
 
-    def _cleanup_segmented_download(self, output_path: Path, part_paths: list[Path]) -> None:
-        if output_path.exists():
-            output_path.unlink()
+    def _segment_part_path(self, output_path: Path, segment: _Segment) -> Path:
+        return output_path.with_name(f"{output_path.name}.segment-{segment.index}")
+
+    def _segment_manifest_path(self, output_path: Path) -> Path:
+        return output_path.with_name(f"{output_path.name}.segments.json")
+
+    def _prepare_segment_manifest(
+        self,
+        *,
+        output_path: Path,
+        resource: str,
+        total_bytes: int,
+        etag: str | None,
+        last_modified: str | None,
+        segments: list[_Segment],
+        part_paths: list[Path],
+    ) -> Path:
+        manifest_path = self._segment_manifest_path(output_path)
+        expected_manifest = self._segment_manifest_data(
+            resource=resource,
+            total_bytes=total_bytes,
+            etag=etag,
+            last_modified=last_modified,
+            segments=segments,
+        )
+        if manifest_path.exists():
+            try:
+                existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing_manifest = None
+            if self._segment_manifest_matches(existing_manifest, expected_manifest):
+                return manifest_path
+            self._cleanup_segment_artifacts(part_paths, manifest_path)
+        else:
+            self._cleanup_segment_artifacts(part_paths, manifest_path)
+        self._write_segment_manifest(manifest_path, expected_manifest)
+        return manifest_path
+
+    def _segment_manifest_data(
+        self,
+        *,
+        resource: str,
+        total_bytes: int,
+        etag: str | None,
+        last_modified: str | None,
+        segments: list[_Segment],
+    ) -> dict[str, object]:
+        now = time.time()
+        return {
+            "version": _SEGMENT_MANIFEST_VERSION,
+            "resource": resource,
+            "total_bytes": total_bytes,
+            "etag": etag,
+            "last_modified": last_modified,
+            "segments": [
+                {
+                    "index": segment.index,
+                    "start": segment.start,
+                    "end": segment.end,
+                    "length": segment.length,
+                }
+                for segment in segments
+            ],
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    def _segment_manifest_matches(self, existing_manifest: object, expected_manifest: dict[str, object]) -> bool:
+        if not isinstance(existing_manifest, dict):
+            return False
+        return (
+            existing_manifest.get("version") == expected_manifest["version"]
+            and existing_manifest.get("resource") == expected_manifest["resource"]
+            and existing_manifest.get("total_bytes") == expected_manifest["total_bytes"]
+            and existing_manifest.get("etag") == expected_manifest["etag"]
+            and existing_manifest.get("last_modified") == expected_manifest["last_modified"]
+            and existing_manifest.get("segments") == expected_manifest["segments"]
+        )
+
+    def _write_segment_manifest(self, manifest_path: Path, manifest: dict[str, object]) -> None:
+        temp_path = manifest_path.with_name(f"{manifest_path.name}.tmp")
+        self._unlink_if_exists(temp_path)
+        try:
+            with self._open_output_file(temp_path) as manifest_file:
+                manifest_file.write(json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+            temp_path.replace(manifest_path)
+        except Exception:
+            self._unlink_if_exists(temp_path)
+            raise
+
+    def _is_complete_segment_file(self, part_path: Path, segment: _Segment) -> bool:
+        try:
+            size = part_path.stat().st_size
+        except FileNotFoundError:
+            return False
+        if size == segment.length:
+            return True
+        self._unlink_if_exists(part_path)
+        return False
+
+    def _cleanup_segment_artifacts(self, part_paths: list[Path], manifest_path: Path) -> None:
         for part_path in part_paths:
-            if part_path.exists():
-                part_path.unlink()
+            self._unlink_if_exists(part_path)
+        self._unlink_if_exists(manifest_path)
+        self._unlink_if_exists(manifest_path.with_name(f"{manifest_path.name}.tmp"))
+
+    def _cleanup_segmented_output(self, output_path: Path) -> None:
+        self._unlink_if_exists(output_path)
+        self._unlink_if_exists(output_path.with_name(f"{output_path.name}.merge"))
+
+    def _unlink_if_exists(self, path: Path) -> None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
 
     def _read_headers(self, tls_socket: ssl.SSLSocket) -> tuple[int, dict[str, str], bytes]:
         buffer = bytearray()

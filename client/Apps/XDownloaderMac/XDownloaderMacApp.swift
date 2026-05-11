@@ -1,5 +1,6 @@
 import AppCore
 import AppKit
+import IOKit.pwr_mgt
 import IOKit.ps
 import Networking
 import PlatformAdapters
@@ -42,6 +43,47 @@ private enum MacNativeStyle {
 
     static func jobTypeSymbol(_ jobType: JobType) -> String {
         jobType.presentationSystemImage
+    }
+}
+
+@MainActor
+private final class MacDownloadActivityAssertion {
+    private var assertionID = IOPMAssertionID(0)
+    private var isActive = false
+
+    func update(runningJobCount: Int) {
+        if runningJobCount > 0 {
+            acquire()
+        } else {
+            release()
+        }
+    }
+
+    deinit {
+        if isActive {
+            IOPMAssertionRelease(assertionID)
+        }
+    }
+
+    private func acquire() {
+        guard !isActive else { return }
+        var newAssertionID = IOPMAssertionID(0)
+        let result = IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            "XDownloader active transfer" as CFString,
+            &newAssertionID
+        )
+        guard result == kIOReturnSuccess else { return }
+        assertionID = newAssertionID
+        isActive = true
+    }
+
+    private func release() {
+        guard isActive else { return }
+        IOPMAssertionRelease(assertionID)
+        assertionID = IOPMAssertionID(0)
+        isActive = false
     }
 }
 
@@ -88,6 +130,7 @@ private struct TransferSpeedSparkline: View {
 
 @main
 struct XDownloaderMacApp: App {
+    @Environment(\.openWindow) private var openWindow
     @State private var store = JobStore(settings: Self.localSettings)
     @State private var selectedJobID: Job.ID?
     @State private var pendingDeleteJob: Job?
@@ -117,6 +160,7 @@ struct XDownloaderMacApp: App {
     @State private var activeQueueActionJobID: Job.ID?
     @State private var isBatchRetryingJobs = false
     @State private var telemetryByJobID: [Job.ID: TransferTelemetry] = [:]
+    @State private var downloadActivityAssertion = MacDownloadActivityAssertion()
     private static let localSettings = makeLocalSettings()
     private static let localSecret = localSettings.localBackendSecret
     private static let localBaseURL = URL(string: "http://127.0.0.1:18767")!
@@ -174,6 +218,10 @@ struct XDownloaderMacApp: App {
         JobQueueOverview(jobs: filteredJobs)
     }
 
+    private var systemQueueOverview: JobQueueOverview {
+        JobQueueOverview(jobs: store.jobs)
+    }
+
     private var runningJobs: [Job] {
         activeJobs.filter { JobQueueLane.lane(for: $0.status) == .running }
     }
@@ -192,6 +240,32 @@ struct XDownloaderMacApp: App {
 
     private var retryableJobs: [Job] {
         store.jobs.filter { $0.status == .failed || $0.status == .canceled }
+    }
+
+    private var menuBarTitle: String {
+        if systemQueueOverview.runningCount > 0 {
+            return "\(systemQueueOverview.runningCount) 下载中"
+        }
+        if systemQueueOverview.queuedCount > 0 {
+            return "\(systemQueueOverview.queuedCount) 排队中"
+        }
+        if store.backendHealthStatus == .unhealthy {
+            return "后端未连接"
+        }
+        return "XDownloader"
+    }
+
+    private var menuBarSystemImage: String {
+        if systemQueueOverview.runningCount > 0 {
+            return "arrow.down.circle.fill"
+        }
+        if systemQueueOverview.queuedCount > 0 {
+            return "clock.fill"
+        }
+        if store.backendHealthStatus == .unhealthy {
+            return "xmark.circle.fill"
+        }
+        return "tray.full"
     }
 
     private static func makeLocalSettings() -> AppSettings {
@@ -368,6 +442,17 @@ struct XDownloaderMacApp: App {
             nextTelemetry[job.id] = telemetry.recording(job: job)
         }
         telemetryByJobID = nextTelemetry
+    }
+
+    private func updateSystemDownloadActivity(for jobs: [Job]) {
+        let overview = JobQueueOverview(jobs: jobs)
+        downloadActivityAssertion.update(runningJobCount: overview.runningCount)
+    }
+
+    private func showMainWindow() {
+        openWindow(id: "main")
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.windows.first { $0.canBecomeMain }?.makeKeyAndOrderFront(nil)
     }
 
     private func sendCompletionNotification(for job: Job) {
@@ -1752,7 +1837,7 @@ struct XDownloaderMacApp: App {
     }
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup("XDownloader", id: "main") {
             NavigationSplitView {
                 materialSidebar
             } detail: {
@@ -1863,11 +1948,13 @@ struct XDownloaderMacApp: App {
             .task {
                 requestNotificationAuthorization()
                 await startApp()
+                updateSystemDownloadActivity(for: store.jobs)
             }
             .task { await refreshBackendHealthPeriodically() }
             .onChange(of: store.jobs) { _, jobs in
                 updateCompletionNotifications(for: jobs)
                 recordTransferTelemetry(for: jobs)
+                updateSystemDownloadActivity(for: jobs)
                 if let selectedJobID, jobs.contains(where: { $0.id == selectedJobID }) {
                     return
                 }
@@ -1892,6 +1979,37 @@ struct XDownloaderMacApp: App {
                 await loadJobLogs(for: visibleSelectedJob)
             }
         }
+
+        MenuBarExtra {
+            Text(menuBarTitle)
+            if systemQueueOverview.runningCount > 0 {
+                Text("正在处理 \(systemQueueOverview.runningCount) 个任务")
+            }
+            if systemQueueOverview.queuedCount > 0 {
+                Text("排队 \(systemQueueOverview.queuedCount) 个任务")
+            }
+            if systemQueueOverview.pausedCount > 0 {
+                Text("暂停 \(systemQueueOverview.pausedCount) 个任务")
+            }
+            Divider()
+            Button("打开主窗口") {
+                showMainWindow()
+            }
+            Button("刷新素材库") {
+                Task { await controller.refreshJobs(store: store) }
+            }
+            .disabled(store.isLoading)
+            Button("重新检测后端") {
+                Task { await refreshBackendHealth(startIfNeeded: true) }
+            }
+            Divider()
+            Button("退出 XDownloader") {
+                NSApp.terminate(nil)
+            }
+        } label: {
+            Label(menuBarTitle, systemImage: menuBarSystemImage)
+        }
+        .menuBarExtraStyle(.menu)
 
         Settings {
             MacDownloadPerformanceSettingsView(
