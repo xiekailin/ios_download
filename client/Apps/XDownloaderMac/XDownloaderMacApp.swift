@@ -170,6 +170,22 @@ struct XDownloaderMacApp: App {
         filteredJobs.filter { !$0.status.isTerminal }
     }
 
+    private var queueOverview: JobQueueOverview {
+        JobQueueOverview(jobs: filteredJobs)
+    }
+
+    private var runningJobs: [Job] {
+        activeJobs.filter { JobQueueLane.lane(for: $0.status) == .running }
+    }
+
+    private var queuedJobs: [Job] {
+        activeJobs.filter { JobQueueLane.lane(for: $0.status) == .queued }
+    }
+
+    private var pausedJobs: [Job] {
+        activeJobs.filter { JobQueueLane.lane(for: $0.status) == .paused }
+    }
+
     private var attentionJobs: [Job] {
         filteredJobs.filter { $0.status == .failed || $0.status == .canceled }
     }
@@ -618,10 +634,61 @@ struct XDownloaderMacApp: App {
             .labelsHidden()
             .pickerStyle(.menu)
             .frame(maxWidth: .infinity, alignment: .leading)
+
+            queueOverviewPanel(queueOverview)
         }
         .padding(.horizontal, 12)
         .padding(.top, 12)
         .padding(.bottom, 8)
+    }
+
+    @ViewBuilder
+    private func queueOverviewPanel(_ overview: JobQueueOverview) -> some View {
+        if overview.totalActiveCount > 0 {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    queueOverviewMetric("处理", count: overview.runningCount, color: .accentColor)
+                    queueOverviewMetric("排队", count: overview.queuedCount, color: .orange)
+                    queueOverviewMetric("暂停", count: overview.pausedCount, color: .secondary)
+                }
+
+                if !overview.platformSummaries.isEmpty {
+                    Divider()
+                    VStack(alignment: .leading, spacing: 5) {
+                        ForEach(overview.platformSummaries.prefix(3)) { item in
+                            HStack(spacing: 6) {
+                                Text(item.title)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                                Spacer(minLength: 8)
+                                Text("\(item.count)")
+                                    .monospacedDigit()
+                                    .foregroundStyle(.secondary)
+                            }
+                            .font(.caption2)
+                        }
+                    }
+                }
+            }
+            .padding(9)
+            .background(MacNativeStyle.subtleBackground, in: RoundedRectangle(cornerRadius: MacNativeStyle.cornerRadius))
+            .overlay(
+                RoundedRectangle(cornerRadius: MacNativeStyle.cornerRadius)
+                    .stroke(MacNativeStyle.border.opacity(0.7), lineWidth: 1)
+            )
+        }
+    }
+
+    private func queueOverviewMetric(_ title: String, count: Int, color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text("\(count)")
+                .font(.caption.monospacedDigit().weight(.semibold))
+                .foregroundStyle(color)
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var sidebarFooter: some View {
@@ -1614,69 +1681,82 @@ struct XDownloaderMacApp: App {
         )
     }
 
+    private var materialSidebar: some View {
+        VStack(spacing: 0) {
+            sidebarHeader
+            materialList
+                .searchable(text: $jobSearchText, prompt: "搜索素材")
+            sidebarFooter
+        }
+        .navigationTitle("素材库")
+    }
+
+    private var materialList: some View {
+        List(selection: $selectedJobID) {
+            activeJobsSection(JobQueueLane.running.title, jobs: runningJobs)
+            activeJobsSection(JobQueueLane.queued.title, jobs: queuedJobs)
+            activeJobsSection(JobQueueLane.paused.title, jobs: pausedJobs)
+            terminalJobsSection("已完成", jobs: completedJobs)
+            terminalJobsSection("需要处理", jobs: attentionJobs)
+        }
+    }
+
+    @ViewBuilder
+    private func activeJobsSection(_ title: String, jobs: [Job]) -> some View {
+        if !jobs.isEmpty {
+            Section(title) {
+                ForEach(jobs) { job in
+                    activeSidebarRow(job)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func terminalJobsSection(_ title: String, jobs: [Job]) -> some View {
+        if !jobs.isEmpty {
+            Section(title) {
+                ForEach(jobs) { job in
+                    sidebarRow(job)
+                        .tag(job.id)
+                        .contextMenu {
+                            Button("删除记录") {
+                                pendingDeleteJob = job
+                            }
+                        }
+                }
+            }
+        }
+    }
+
+    private var materialDetail: some View {
+        ScrollView {
+            selectedJobDetailContent
+                .frame(maxWidth: 860, alignment: .leading)
+                .padding(20)
+                .padding(.bottom, 56)
+        }
+        .background(Color(NSColor.windowBackgroundColor))
+        .navigationTitle(visibleSelectedJob?.mediaTitle ?? "素材库")
+    }
+
+    @ViewBuilder
+    private var selectedJobDetailContent: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if let job = visibleSelectedJob {
+                jobDetailPanel(job)
+            } else {
+                emptyHistoryPanel
+            }
+        }
+    }
+
     var body: some Scene {
         WindowGroup {
             NavigationSplitView {
-                VStack(spacing: 0) {
-                    sidebarHeader
-
-                    List(selection: $selectedJobID) {
-                        if !activeJobs.isEmpty {
-                            Section("进行中与队列") {
-                                ForEach(activeJobs) { job in
-                                    activeSidebarRow(job)
-                                }
-                            }
-                        }
-
-                        if !completedJobs.isEmpty {
-                            Section("已完成") {
-                                ForEach(completedJobs) { job in
-                                    sidebarRow(job)
-                                        .tag(job.id)
-                                        .contextMenu {
-                                            Button("删除记录") {
-                                                pendingDeleteJob = job
-                                            }
-                                        }
-                                }
-                            }
-                        }
-
-                        if !attentionJobs.isEmpty {
-                            Section("需要处理") {
-                                ForEach(attentionJobs) { job in
-                                    sidebarRow(job)
-                                        .tag(job.id)
-                                        .contextMenu {
-                                            Button("删除记录") {
-                                                pendingDeleteJob = job
-                                            }
-                                        }
-                                }
-                            }
-                        }
-                    }
-                    .searchable(text: $jobSearchText, prompt: "搜索素材")
-
-                    sidebarFooter
-                }
-                .navigationTitle("素材库")
+                materialSidebar
             } detail: {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        if let job = visibleSelectedJob {
-                            jobDetailPanel(job)
-                        } else {
-                            emptyHistoryPanel
-                        }
-                    }
-                    .frame(maxWidth: 860, alignment: .leading)
-                    .padding(20)
-                    .padding(.bottom, 56)
-                }
-                .background(Color(NSColor.windowBackgroundColor))
-                .navigationTitle(visibleSelectedJob?.mediaTitle ?? "素材库")
+                materialDetail
             }
             .frame(minWidth: 900, minHeight: 560)
             .toolbar {

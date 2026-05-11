@@ -722,6 +722,154 @@ public struct Job: Codable, Identifiable, Sendable, Equatable {
     }
 }
 
+public enum JobQueueLane: String, CaseIterable, Identifiable, Sendable, Equatable {
+    case running
+    case queued
+    case paused
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .running:
+            "正在处理"
+        case .queued:
+            "排队中"
+        case .paused:
+            "已暂停"
+        }
+    }
+
+    public static func lane(for status: JobStatus) -> JobQueueLane? {
+        switch status {
+        case .created, .queued:
+            .queued
+        case .paused:
+            .paused
+        case .resolving, .resolved, .downloading, .muxing, .storing:
+            .running
+        case .completed, .failed, .canceled:
+            nil
+        }
+    }
+}
+
+public struct JobQueuePlatformSummary: Identifiable, Sendable, Equatable {
+    public var id: String { title }
+    public let title: String
+    public let count: Int
+
+    public init(title: String, count: Int) {
+        self.title = title
+        self.count = count
+    }
+}
+
+public struct JobQueueOverview: Sendable, Equatable {
+    public let runningCount: Int
+    public let queuedCount: Int
+    public let pausedCount: Int
+    public let platformSummaries: [JobQueuePlatformSummary]
+
+    public var totalActiveCount: Int {
+        runningCount + queuedCount + pausedCount
+    }
+
+    public init(jobs: [Job]) {
+        var runningCount = 0
+        var queuedCount = 0
+        var pausedCount = 0
+        var platformCounts: [String: Int] = [:]
+
+        for job in jobs {
+            guard let lane = JobQueueLane.lane(for: job.status) else { continue }
+            switch lane {
+            case .running:
+                runningCount += 1
+            case .queued:
+                queuedCount += 1
+            case .paused:
+                pausedCount += 1
+            }
+            platformCounts[job.queuePlatformTitle, default: 0] += 1
+        }
+
+        self.runningCount = runningCount
+        self.queuedCount = queuedCount
+        self.pausedCount = pausedCount
+        self.platformSummaries = platformCounts
+            .map { JobQueuePlatformSummary(title: $0.key, count: $0.value) }
+            .sorted { left, right in
+                if left.count != right.count {
+                    return left.count > right.count
+                }
+                return left.title.localizedStandardCompare(right.title) == .orderedAscending
+            }
+    }
+}
+
+public extension Job {
+    var queuePlatformTitle: String {
+        if let providerTitle = Self.platformTitle(provider: provider) {
+            return providerTitle
+        }
+        guard let host = URL(string: sourceURL)?.host?.lowercased() else {
+            return "未知平台"
+        }
+        return Self.platformTitle(host: host) ?? host.removingWWWPrefix()
+    }
+
+    private static func platformTitle(provider: String?) -> String? {
+        guard let provider, !provider.isEmpty else { return nil }
+        return platformTitle(key: provider)
+    }
+
+    private static func platformTitle(host: String) -> String? {
+        if host == "youtu.be" || host.hasSuffix("youtube.com") {
+            return "YouTube"
+        }
+        if host.hasSuffix("bilibili.com") {
+            return "Bilibili"
+        }
+        if host.hasSuffix("douyin.com") {
+            return "Douyin"
+        }
+        if host == "x.com" || host.hasSuffix("twitter.com") {
+            return "X"
+        }
+        if host.hasSuffix("tiktok.com") {
+            return "TikTok"
+        }
+        return nil
+    }
+
+    private static func platformTitle(key: String) -> String? {
+        switch key.lowercased() {
+        case "youtube", "youtu", "yt":
+            "YouTube"
+        case "bilibili", "bili":
+            "Bilibili"
+        case "douyin":
+            "Douyin"
+        case "x", "twitter":
+            "X"
+        case "tiktok":
+            "TikTok"
+        default:
+            nil
+        }
+    }
+}
+
+private extension String {
+    func removingWWWPrefix() -> String {
+        if hasPrefix("www.") {
+            return String(dropFirst(4))
+        }
+        return self
+    }
+}
+
 public struct ArtifactSummary: Codable, Identifiable, Sendable, Equatable {
     public let id: String
     public let jobID: String

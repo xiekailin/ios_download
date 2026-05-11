@@ -3,7 +3,10 @@ import Foundation
 import Testing
 
 private func makePresentationJob(
+    id: String = "job-1",
     status: JobStatus,
+    sourceURL: String = "https://x.com/demo/status/1",
+    provider: String? = nil,
     errorCode: String? = nil,
     errorMessage: String? = nil,
     userMessage: String? = nil,
@@ -12,11 +15,11 @@ private func makePresentationJob(
 ) -> Job {
     let now = Date()
     return Job(
-        id: "job-1",
+        id: id,
         deviceID: "device-1",
-        sourceURL: "https://x.com/demo/status/1",
-        normalizedURL: "https://x.com/demo/status/1",
-        provider: nil,
+        sourceURL: sourceURL,
+        normalizedURL: sourceURL,
+        provider: provider,
         status: status,
         progress: 0,
         downloadedBytes: downloadedBytes,
@@ -131,6 +134,33 @@ private func makePresentationJob(
 
     #expect(job.metricsText?.contains("已下载") == true)
     #expect(job.metricsText?.contains("速度") == true)
+}
+
+@Test func jobQueueOverviewCountsActiveLanesAndPlatforms() {
+    let jobs = [
+        makePresentationJob(id: "queued-1", status: .queued, sourceURL: "https://www.bilibili.com/video/BV1", provider: "bilibili"),
+        makePresentationJob(id: "downloading-1", status: .downloading, sourceURL: "https://www.youtube.com/watch?v=1"),
+        makePresentationJob(id: "muxing-1", status: .muxing, sourceURL: "https://youtu.be/demo"),
+        makePresentationJob(id: "paused-1", status: .paused, sourceURL: "https://x.com/demo/status/1"),
+        makePresentationJob(id: "done-1", status: .completed, sourceURL: "https://www.youtube.com/watch?v=done"),
+    ]
+
+    let overview = JobQueueOverview(jobs: jobs)
+
+    #expect(overview.totalActiveCount == 4)
+    #expect(overview.runningCount == 2)
+    #expect(overview.queuedCount == 1)
+    #expect(overview.pausedCount == 1)
+    #expect(overview.platformSummaries.map(\.title) == ["YouTube", "Bilibili", "X"])
+    #expect(overview.platformSummaries.map(\.count) == [2, 1, 1])
+}
+
+@Test func jobQueueOverviewUsesHostWhenProviderIsUnknown() {
+    let job = makePresentationJob(status: .queued, sourceURL: "https://media.example.com/watch/1")
+
+    let overview = JobQueueOverview(jobs: [job])
+
+    #expect(overview.platformSummaries.first?.title == "media.example.com")
 }
 
 @Test func artifactMediaDetailsTextFormatsAvailableFields() {
