@@ -288,12 +288,20 @@ private func makePresentationJob(
     let automaticLowPower = DownloadPerformanceSettings.automaticDefaults(
         activeProcessorCount: 10,
         isLowPowerModeEnabled: true,
-        isThermallyConstrained: false
+        isThermallyConstrained: false,
+        isExternalPowerConnected: true
     )
-    let automaticFast = DownloadPerformanceSettings.automaticDefaults(
+    let automaticBattery = DownloadPerformanceSettings.automaticDefaults(
         activeProcessorCount: 10,
         isLowPowerModeEnabled: false,
-        isThermallyConstrained: false
+        isThermallyConstrained: false,
+        isExternalPowerConnected: false
+    )
+    let automaticFast = DownloadPerformanceSettings.automaticDefaults(
+        activeProcessorCount: 4,
+        isLowPowerModeEnabled: false,
+        isThermallyConstrained: false,
+        isExternalPowerConnected: true
     )
     let performance = DownloadPerformanceSettings.defaults(for: .performance)
 
@@ -302,6 +310,9 @@ private func makePresentationJob(
     #expect(lowPower.ytdlpConcurrentFragments == 1)
     #expect(automaticLowPower.performanceMode == .automatic)
     #expect(automaticLowPower.simultaneousDownloadJobs == 1)
+    #expect(automaticBattery.performanceMode == .automatic)
+    #expect(automaticBattery.simultaneousDownloadJobs == 2)
+    #expect(automaticBattery.directDownloadMaxConnectionsForBackend == 4)
     #expect(automaticFast.performanceMode == .automatic)
     #expect(automaticFast.simultaneousDownloadJobs == 4)
     #expect(automaticFast.directDownloadMaxConnectionsForBackend == 8)

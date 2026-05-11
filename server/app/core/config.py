@@ -77,10 +77,7 @@ def _get_performance_mode_env() -> str:
 def _effective_performance_mode(mode: str) -> str:
     if mode != "auto":
         return mode
-    cpu_count = os.cpu_count() or 4
-    if cpu_count >= 8:
-        return "performance"
-    return "balanced"
+    return "performance"
 
 
 def _get_ytdlp_format_strategy_env() -> str:

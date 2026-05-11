@@ -58,6 +58,13 @@ _DELEGATE_RETRYABLE_ERROR_MARKERS = (
     "temporarily unavailable",
     "network is unreachable",
 )
+_DELEGATE_RATE_LIMIT_ERROR_MARKERS = (
+    "http error 429",
+    "too many requests",
+    "rate limit",
+    "rate-limit",
+    "ratelimit",
+)
 _DELEGATE_NON_RETRYABLE_ERROR_MARKERS = (
     "canceled",
     "cancelled",
@@ -399,17 +406,26 @@ class DownloadJobWorker:
         return self._finalize_delegate_artifact(artifact_path, title=title, fallback=job_id)
 
     def _run_delegate_download_with_retries(self, *, job_id: str, command: list[str], source_url: str) -> None:
+        retry_command = command
+        did_downgrade_for_rate_limit = False
         for attempt in range(_DELEGATE_DOWNLOAD_RETRY_COUNT + 1):
             self._raise_if_job_canceled(job_id)
             if attempt > 0:
                 self._cleanup_delegate_outputs(job_id, keep_partials=True)
             try:
-                self._run_delegate_download_once(job_id=job_id, command=command, source_url=source_url)
+                self._run_delegate_download_once(job_id=job_id, command=retry_command, source_url=source_url)
                 return
             except DownloadAppError as exc:
                 self._raise_if_job_canceled(job_id)
                 if attempt == _DELEGATE_DOWNLOAD_RETRY_COUNT or not self._is_retryable_delegate_download_error(exc):
                     raise
+                if (
+                    self._settings.performance_mode == "auto"
+                    and not did_downgrade_for_rate_limit
+                    and self._is_rate_limited_delegate_download_error(exc)
+                ):
+                    retry_command = self._rate_limited_delegate_command(retry_command)
+                    did_downgrade_for_rate_limit = True
 
     def _raise_if_job_canceled(self, job_id: str) -> None:
         current = self._jobs.get(job_id)
@@ -439,6 +455,49 @@ class DownloadJobWorker:
         if any(marker in message for marker in _DELEGATE_NON_RETRYABLE_ERROR_MARKERS):
             return False
         return any(marker in message for marker in _DELEGATE_RETRYABLE_ERROR_MARKERS)
+
+    def _is_rate_limited_delegate_download_error(self, exc: DownloadAppError) -> bool:
+        message = exc.message.lower()
+        return any(marker in message for marker in _DELEGATE_RATE_LIMIT_ERROR_MARKERS)
+
+    def _rate_limited_delegate_command(self, command: list[str]) -> list[str]:
+        adjusted: list[str] = []
+        skip_next = False
+        saw_concurrent_fragments = False
+        for index, arg in enumerate(command):
+            if skip_next:
+                skip_next = False
+                continue
+            if arg == "--concurrent-fragments":
+                saw_concurrent_fragments = True
+                current_value = command[index + 1] if index + 1 < len(command) else "1"
+                try:
+                    fragments = min(max(1, int(current_value)), 2)
+                except ValueError:
+                    fragments = 2
+                adjusted.extend([arg, str(fragments)])
+                skip_next = True
+                continue
+            if arg in {"--downloader", "--downloader-args"}:
+                skip_next = True
+                continue
+            adjusted.append(arg)
+
+        extra_args: list[str] = []
+        if not saw_concurrent_fragments:
+            extra_args.extend(["--concurrent-fragments", "2"])
+        if "--sleep-requests" not in adjusted:
+            extra_args.extend(["--sleep-requests", "1"])
+        if "--sleep-interval" not in adjusted:
+            extra_args.extend(["--sleep-interval", "1"])
+        if "--max-sleep-interval" not in adjusted:
+            extra_args.extend(["--max-sleep-interval", "3"])
+        if not extra_args:
+            return adjusted
+        if "--" in adjusted:
+            separator_index = adjusted.index("--")
+            return [*adjusted[:separator_index], *extra_args, *adjusted[separator_index:]]
+        return [*adjusted, *extra_args]
 
     def _delegate_download_command(
         self,

@@ -784,22 +784,23 @@ public struct DownloadPerformanceSettings: Codable, Sendable, Equatable {
     public static func automaticDefaults(
         activeProcessorCount: Int,
         isLowPowerModeEnabled: Bool,
-        isThermallyConstrained: Bool
+        isThermallyConstrained: Bool,
+        isExternalPowerConnected: Bool = true
     ) -> DownloadPerformanceSettings {
         let baseMode: DownloadPerformanceMode
         if isLowPowerModeEnabled || isThermallyConstrained {
             baseMode = .lowPower
-        } else if activeProcessorCount >= 8 {
-            baseMode = .performance
-        } else {
+        } else if !isExternalPowerConnected {
             baseMode = .balanced
+        } else {
+            baseMode = .performance
         }
         var settings = defaults(for: baseMode)
         settings.performanceMode = .automatic
         return settings
     }
 
-    public static func automaticDefaultsForCurrentDevice() -> DownloadPerformanceSettings {
+    public static func automaticDefaultsForCurrentDevice(isExternalPowerConnected: Bool = true) -> DownloadPerformanceSettings {
         let processInfo = ProcessInfo.processInfo
         let isThermallyConstrained: Bool
         switch processInfo.thermalState {
@@ -813,13 +814,14 @@ public struct DownloadPerformanceSettings: Codable, Sendable, Equatable {
         return automaticDefaults(
             activeProcessorCount: processInfo.activeProcessorCount,
             isLowPowerModeEnabled: processInfo.isLowPowerModeEnabled,
-            isThermallyConstrained: isThermallyConstrained
+            isThermallyConstrained: isThermallyConstrained,
+            isExternalPowerConnected: isExternalPowerConnected
         )
     }
 
-    public func resolvedForCurrentDevice() -> DownloadPerformanceSettings {
+    public func resolvedForCurrentDevice(isExternalPowerConnected: Bool = true) -> DownloadPerformanceSettings {
         guard performanceMode == .automatic else { return self }
-        var settings = Self.automaticDefaultsForCurrentDevice()
+        var settings = Self.automaticDefaultsForCurrentDevice(isExternalPowerConnected: isExternalPowerConnected)
         settings.downloadRateLimit = downloadRateLimit
         return settings
     }

@@ -127,14 +127,14 @@ class AppTests(unittest.TestCase):
         self.assertEqual(settings.download_worker_max_jobs, 4)
         self.assertEqual(settings.audio_separation_worker_max_jobs, 1)
 
-    def test_auto_performance_mode_uses_machine_capacity(self) -> None:
+    def test_auto_performance_mode_defaults_to_performance(self) -> None:
         os.environ["XDL_PERFORMANCE_MODE"] = "auto"
         os.environ.pop("XDL_WORKER_MAX_JOBS", None)
         os.environ.pop("XDL_DOWNLOAD_WORKER_MAX_JOBS", None)
         os.environ.pop("XDL_YTDLP_CONCURRENT_FRAGMENTS", None)
         os.environ.pop("XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS", None)
 
-        with patch("os.cpu_count", return_value=10):
+        with patch("os.cpu_count", return_value=4):
             settings = Settings.from_env()
 
         self.assertEqual(settings.performance_mode, "auto")
@@ -2260,6 +2260,47 @@ class AppTests(unittest.TestCase):
 
         self.assertEqual(calls, 2)
         self.assertTrue(part_path.exists())
+
+    def test_delegate_download_auto_mode_retries_rate_limit_with_conservative_command(self) -> None:
+        self.container.settings.performance_mode = "auto"
+        worker = DownloadJobWorker(
+            settings=self.container.settings,
+            jobs=self.container.job_service._repository,
+            artifacts=self.container.artifact_service._artifacts,
+            selector=self.container.job_service._runner.worker._selector,
+        )
+        commands: list[list[str]] = []
+
+        def fake_run_once(*, job_id: str, command: list[str], source_url: str) -> None:
+            commands.append(command)
+            if len(commands) == 1:
+                raise DownloadAppError("HTTP Error 429: Too Many Requests")
+
+        command = [
+            "yt-dlp",
+            "--concurrent-fragments",
+            "8",
+            "--downloader",
+            "aria2c",
+            "--downloader-args",
+            "aria2c:-x 8 -s 8 -k 1M",
+            "--",
+            "https://x.com/demo/status/12345",
+        ]
+
+        with patch.object(worker, "_raise_if_job_canceled", return_value=None):
+            with patch.object(worker, "_run_delegate_download_once", side_effect=fake_run_once):
+                worker._run_delegate_download_with_retries(
+                    job_id="job-1",
+                    command=command,
+                    source_url="https://x.com/demo/status/12345",
+                )
+
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(commands[1][commands[1].index("--concurrent-fragments") + 1], "2")
+        self.assertNotIn("--downloader", commands[1])
+        self.assertNotIn("--downloader-args", commands[1])
+        self.assertIn("--sleep-requests", commands[1])
 
     def test_delegate_download_fails_after_timeout_retries_are_exhausted(self) -> None:
         worker = DownloadJobWorker(

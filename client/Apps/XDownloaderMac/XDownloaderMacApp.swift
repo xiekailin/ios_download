@@ -1,5 +1,6 @@
 import AppCore
 import AppKit
+import IOKit.ps
 import Networking
 import PlatformAdapters
 import SharedUI
@@ -157,7 +158,9 @@ struct XDownloaderMacApp: App {
     }
 
     private func makeLocalBackendLauncher() -> LocalBackendLauncher {
-        let performanceSettings = store.settings.downloadPerformance.resolvedForCurrentDevice()
+        let performanceSettings = store.settings.downloadPerformance.resolvedForCurrentDevice(
+            isExternalPowerConnected: isExternalPowerConnected()
+        )
         return LocalBackendLauncher(
             environment: LocalBackendLauncher.defaultEnvironment(performanceSettings: performanceSettings),
             localSecret: store.settings.localBackendSecret
@@ -180,6 +183,20 @@ struct XDownloaderMacApp: App {
 
     private func resetDownloadPerformanceSettings() {
         saveDownloadPerformanceSettings(.balanced)
+    }
+
+    private func automaticDownloadPerformanceSettings() -> DownloadPerformanceSettings {
+        DownloadPerformanceSettings.automaticDefaultsForCurrentDevice(
+            isExternalPowerConnected: isExternalPowerConnected()
+        )
+    }
+
+    private func isExternalPowerConnected() -> Bool {
+        guard let powerSourceInfo = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let powerSourceType = IOPSGetProvidingPowerSourceType(powerSourceInfo)?.takeUnretainedValue() as String? else {
+            return true
+        }
+        return powerSourceType != (kIOPSBatteryPowerValue as String)
     }
 
     private func restartBackendForCurrentSettings() {
@@ -1305,6 +1322,7 @@ struct XDownloaderMacApp: App {
                 performance: downloadPerformanceBinding,
                 statusMessage: settingsSaveMessage,
                 isRestartingBackend: isRestartingBackend,
+                automaticDefaults: automaticDownloadPerformanceSettings,
                 resetToBalanced: resetDownloadPerformanceSettings,
                 restartBackend: restartBackendForCurrentSettings
             )
@@ -1316,6 +1334,7 @@ private struct MacDownloadPerformanceSettingsView: View {
     @Binding var performance: DownloadPerformanceSettings
     let statusMessage: String?
     let isRestartingBackend: Bool
+    let automaticDefaults: () -> DownloadPerformanceSettings
     let resetToBalanced: () -> Void
     let restartBackend: () -> Void
 
@@ -1336,11 +1355,11 @@ private struct MacDownloadPerformanceSettingsView: View {
                 }
                 .pickerStyle(.segmented)
                 .onChange(of: performance.performanceMode) { _, mode in
-                    performance = DownloadPerformanceSettings.defaults(for: mode)
+                    performance = mode == .automatic ? automaticDefaults() : DownloadPerformanceSettings.defaults(for: mode)
                 }
 
                 if usesAutomaticPerformance {
-                    Text("自动会在每次应用配置时根据低电量模式、系统温度和 CPU 核心数选择资源档位。")
+                    Text("自动模式默认使用高速；未插电会降到均衡，低电量或系统发热会降到省电。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

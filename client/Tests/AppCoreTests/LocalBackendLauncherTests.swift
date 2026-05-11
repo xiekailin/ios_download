@@ -737,7 +737,8 @@ struct LocalBackendLauncherTests {
     let performance = DownloadPerformanceSettings.automaticDefaults(
         activeProcessorCount: 10,
         isLowPowerModeEnabled: false,
-        isThermallyConstrained: false
+        isThermallyConstrained: false,
+        isExternalPowerConnected: true
     )
 
     let environment = LocalBackendLauncher.defaultEnvironment(performanceSettings: performance)
