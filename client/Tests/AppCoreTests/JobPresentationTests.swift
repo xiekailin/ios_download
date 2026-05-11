@@ -60,9 +60,11 @@ private func makePresentationJob(
     let job = makePresentationJob(status: .failed, errorMessage: "HTTP Error 429: Too Many Requests")
 
     #expect(job.failureRecoveryAdvice?.title == "平台正在限流")
-    #expect(job.failureRecoveryAdvice?.detail.contains("稍后") == true)
-    #expect(job.failureRecoveryAdvice?.actionTitle == "稍后重试")
-    #expect(job.failureRecoveryAdvice?.action == .retry)
+    #expect(job.failureRecoveryAdvice?.detail.contains("稳妥") == true)
+    #expect(job.failureRecoveryAdvice?.actionTitle == "降速修复并重试")
+    #expect(job.failureRecoveryAdvice?.action == .applyConservativeModeAndRetry)
+    #expect(job.failureRecoveryAdvice?.secondaryActionTitle == "只重试任务")
+    #expect(job.failureRecoveryAdvice?.secondaryAction == .retry)
 }
 
 @Test func failedJobRecoveryAdviceClassifiesLoginVerification() {
@@ -72,6 +74,8 @@ private func makePresentationJob(
     #expect(job.failureRecoveryAdvice?.detail.contains("Cookie") == true)
     #expect(job.failureRecoveryAdvice?.actionTitle == "选择 Cookie 并重试")
     #expect(job.failureRecoveryAdvice?.action == .uploadCookiesAndRetry)
+    #expect(job.failureRecoveryAdvice?.secondaryActionTitle == "查看日志")
+    #expect(job.failureRecoveryAdvice?.secondaryAction == .inspectLogs)
 }
 
 @Test func failedJobRecoveryAdviceClassifiesDiskSpace() {
@@ -81,6 +85,8 @@ private func makePresentationJob(
     #expect(job.failureRecoveryAdvice?.detail.contains("释放") == true)
     #expect(job.failureRecoveryAdvice?.actionTitle == "打开下载目录")
     #expect(job.failureRecoveryAdvice?.action == .openDownloadsFolder)
+    #expect(job.failureRecoveryAdvice?.secondaryActionTitle == "清理后重试")
+    #expect(job.failureRecoveryAdvice?.secondaryAction == .retry)
 }
 
 @Test func failedJobRecoveryAdviceClassifiesNetworkRecovery() {
@@ -88,6 +94,16 @@ private func makePresentationJob(
 
     #expect(job.failureRecoveryAdvice?.title == "网络连接不稳定")
     #expect(job.failureRecoveryAdvice?.action == .recheckBackendAndRetry)
+    #expect(job.failureRecoveryAdvice?.secondaryAction == .inspectLogs)
+}
+
+@Test func failedJobRecoveryAdviceOpensSourceForUnavailableMaterial() {
+    let job = makePresentationJob(status: .failed, errorMessage: "This video is private")
+
+    #expect(job.failureRecoveryAdvice?.title == "素材不可访问")
+    #expect(job.failureRecoveryAdvice?.actionTitle == "打开源链接")
+    #expect(job.failureRecoveryAdvice?.action == .openSourceInBrowser)
+    #expect(job.failureRecoveryAdvice?.secondaryAction == .inspectLogs)
 }
 
 @Test func activeJobDoesNotShowRecoveryAdvice() {

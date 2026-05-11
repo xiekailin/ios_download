@@ -236,6 +236,15 @@ struct XDownloaderMacApp: App {
         saveDownloadPerformanceSettings(.balanced)
     }
 
+    private func conservativeRecoveryPerformanceSettings() -> DownloadPerformanceSettings {
+        var settings = DownloadPerformanceSettings.defaults(for: .lowPower)
+        let current = store.settings.downloadPerformance
+        settings.nightDownloadEnabled = current.nightDownloadEnabled
+        settings.nightDownloadStartHour = current.nightDownloadStartHour
+        settings.nightDownloadEndHour = current.nightDownloadEndHour
+        return settings
+    }
+
     private func automaticDownloadPerformanceSettings() -> DownloadPerformanceSettings {
         DownloadPerformanceSettings.automaticDefaultsForCurrentDevice(
             isExternalPowerConnected: isExternalPowerConnected()
@@ -833,18 +842,32 @@ struct XDownloaderMacApp: App {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                Button {
-                    performFailureRecovery(advice, for: job)
-                } label: {
-                    if activeFailureRecoveryJobID == job.id {
-                        Label("处理中…", systemImage: "clock")
-                    } else {
-                        Label(advice.actionTitle, systemImage: recoveryActionSystemImage(advice.action))
+                HStack(spacing: 8) {
+                    Button {
+                        performFailureRecovery(advice.action, for: job)
+                    } label: {
+                        if activeFailureRecoveryJobID == job.id {
+                            Label("处理中…", systemImage: "clock")
+                        } else {
+                            Label(advice.actionTitle, systemImage: recoveryActionSystemImage(advice.action))
+                        }
+                    }
+                    .controlSize(.small)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(store.isLoading || retryingJobID != nil || activeFailureRecoveryJobID != nil)
+
+                    if let secondaryAction = advice.secondaryAction,
+                       let secondaryActionTitle = advice.secondaryActionTitle {
+                        Button {
+                            performFailureRecovery(secondaryAction, for: job)
+                        } label: {
+                            Label(secondaryActionTitle, systemImage: recoveryActionSystemImage(secondaryAction))
+                        }
+                        .controlSize(.small)
+                        .buttonStyle(.bordered)
+                        .disabled(store.isLoading || retryingJobID != nil || activeFailureRecoveryJobID != nil)
                     }
                 }
-                .controlSize(.small)
-                .buttonStyle(.bordered)
-                .disabled(store.isLoading || retryingJobID != nil || activeFailureRecoveryJobID != nil)
                 .padding(.top, 2)
             }
         }
@@ -1179,16 +1202,20 @@ struct XDownloaderMacApp: App {
         }
     }
 
-    private func performFailureRecovery(_ advice: FailureRecoveryAdvice, for job: Job) {
-        switch advice.action {
+    private func performFailureRecovery(_ action: FailureRecoveryAction, for job: Job) {
+        switch action {
         case .retry:
             retryFailedJob(job, marksRecovery: true)
         case .uploadCookiesAndRetry:
             selectCookieFileAndRetry(job)
         case .recheckBackendAndRetry:
             recheckBackendAndRetry(job)
+        case .applyConservativeModeAndRetry:
+            applyConservativeModeAndRetry(job)
         case .openDownloadsFolder:
             openDownloadsFolderForRecovery(job)
+        case .openSourceInBrowser:
+            openSourceInBrowserForRecovery(job)
         case .inspectLogs:
             isLogSectionExpanded = true
             Task { await loadJobLogs(for: job) }
@@ -1234,6 +1261,34 @@ struct XDownloaderMacApp: App {
         }
     }
 
+    private func applyConservativeModeAndRetry(_ job: Job) {
+        guard activeFailureRecoveryJobID == nil, !store.isLoading else { return }
+        activeFailureRecoveryJobID = job.id
+        resetArtifactState()
+        saveDownloadPerformanceSettings(conservativeRecoveryPerformanceSettings())
+        Task {
+            isRestartingBackend = true
+            defer {
+                isRestartingBackend = false
+                activeFailureRecoveryJobID = nil
+            }
+            do {
+                let status = try await makeLocalBackendLauncher().restartAndCheckHealth()
+                store.setBackendHealthStatus(status)
+                if status == .healthy {
+                    settingsSaveMessage = "已切到稳妥下载模式并重启后端。"
+                    store.setError(nil)
+                    await controller.retryJob(id: job.id, store: store)
+                } else {
+                    store.setError("后端未连接，暂时无法自动重试。")
+                }
+            } catch {
+                store.setBackendHealthStatus(.unhealthy)
+                store.setError(error.localizedDescription)
+            }
+        }
+    }
+
     private func openDownloadsFolderForRecovery(_ job: Job) {
         guard activeFailureRecoveryJobID == nil else { return }
         activeFailureRecoveryJobID = job.id
@@ -1249,6 +1304,14 @@ struct XDownloaderMacApp: App {
         }
     }
 
+    private func openSourceInBrowserForRecovery(_ job: Job) {
+        guard let url = URL(string: job.sourceURL), NSWorkspace.shared.open(url) else {
+            store.setError("打开源链接失败，请复制链接后在浏览器中检查。")
+            return
+        }
+        store.setError(nil)
+    }
+
     private func recoveryActionSystemImage(_ action: FailureRecoveryAction) -> String {
         switch action {
         case .retry:
@@ -1257,8 +1320,12 @@ struct XDownloaderMacApp: App {
             "key.fill"
         case .recheckBackendAndRetry:
             "network"
+        case .applyConservativeModeAndRetry:
+            "speedometer"
         case .openDownloadsFolder:
             "folder"
+        case .openSourceInBrowser:
+            "safari"
         case .inspectLogs:
             "list.bullet.rectangle"
         }
