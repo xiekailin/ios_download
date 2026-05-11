@@ -242,6 +242,7 @@ private func makePresentationJob(
     #expect(settings.localBackendSecret.isEmpty)
     #expect(settings.bootstrapCode == nil)
     #expect(settings.autoSaveCompletedArtifactsToPhotos == false)
+    #expect(settings.downloadPerformance == .balanced)
 }
 
 @Test func appSettingsDecodesAutoSaveCompletedArtifactsPreference() throws {
@@ -251,4 +252,46 @@ private func makePresentationJob(
     let settings = try decoder.decode(AppSettings.self, from: json)
 
     #expect(settings.autoSaveCompletedArtifactsToPhotos)
+}
+
+@Test func appSettingsDecodesDownloadPerformanceSettings() throws {
+    let json = """
+    {
+      "apiBaseURL": "http://127.0.0.1:8000",
+      "downloadPerformance": {
+        "performanceMode": "performance",
+        "directDownloadAccelerationEnabled": true,
+        "directDownloadMaxConnections": 8,
+        "directDownloadSegmentSizeBytes": 8388608,
+        "simultaneousDownloadJobs": 3,
+        "ytdlpConcurrentFragments": 8,
+        "ffmpegThreadCount": 4,
+        "downloadRateLimit": "5M"
+      }
+    }
+    """.data(using: .utf8)!
+    let decoder = JSONDecoder()
+
+    let settings = try decoder.decode(AppSettings.self, from: json)
+
+    #expect(settings.downloadPerformance.performanceMode == .performance)
+    #expect(settings.downloadPerformance.directDownloadMaxConnections == 8)
+    #expect(settings.downloadPerformance.directDownloadSegmentSizeBytes == 8 * 1024 * 1024)
+    #expect(settings.downloadPerformance.simultaneousDownloadJobs == 3)
+    #expect(settings.downloadPerformance.ytdlpConcurrentFragments == 8)
+    #expect(settings.downloadPerformance.ffmpegThreadCount == 4)
+    #expect(settings.downloadPerformance.downloadRateLimit == "5M")
+}
+
+@Test func downloadPerformanceModePresetsTuneBackendValues() {
+    let lowPower = DownloadPerformanceSettings.defaults(for: .lowPower)
+    let performance = DownloadPerformanceSettings.defaults(for: .performance)
+
+    #expect(lowPower.simultaneousDownloadJobs == 1)
+    #expect(lowPower.directDownloadMaxConnectionsForBackend == 1)
+    #expect(lowPower.ytdlpConcurrentFragments == 1)
+    #expect(performance.simultaneousDownloadJobs == 4)
+    #expect(performance.directDownloadMaxConnectionsForBackend == 8)
+    #expect(performance.ytdlpConcurrentFragments == 8)
+    #expect(performance.directDownloadSegmentSizeBytes == 8 * 1024 * 1024)
 }

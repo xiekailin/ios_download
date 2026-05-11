@@ -137,6 +137,13 @@ public struct LocalBackendLauncher: Sendable {
         return await checkHealth()
     }
 
+    public func restartAndCheckHealth() async throws -> BackendHealthStatus {
+        await requestShutdown()
+        try await waitForCurrentBackendToShutdown()
+        _ = try await startIfNeeded()
+        return await checkHealth()
+    }
+
     public func startIfNeeded() async throws -> BackendProcess? {
         try await Self.startupGate.run(key: startupKey) {
             try await startIfNeededWithoutGate()
@@ -270,6 +277,27 @@ public struct LocalBackendLauncher: Sendable {
         throw LocalBackendLauncherError.healthCheckTimedOut
     }
 
+    private func waitForCurrentBackendToShutdown() async throws {
+        let start = ContinuousClock.now
+        var consecutiveUnavailable = 0
+        while start.duration(to: .now) < startupTimeout {
+            try Task.checkCancellation()
+            switch await healthState() {
+            case .unavailable:
+                consecutiveUnavailable += 1
+                if consecutiveUnavailable >= Self.startupProbeAttempts {
+                    return
+                }
+            case .occupiedByOtherService:
+                throw LocalBackendLauncherError.portOccupied
+            case .matching, .mismatchedConfiguration:
+                consecutiveUnavailable = 0
+            }
+            try await Task.sleep(for: startupRetryDelay)
+        }
+        throw LocalBackendLauncherError.healthCheckTimedOut
+    }
+
     private func requestShutdown() async {
         let nonce = UUID().uuidString
         let shutdownURL = healthURL.appending(path: "shutdown").appending(queryItems: [URLQueryItem(name: "nonce", value: nonce)])
@@ -321,7 +349,10 @@ public struct LocalBackendLauncher: Sendable {
         ]
     }
 
-    public static func defaultEnvironment(resourceURL: URL? = Bundle.main.resourceURL) -> [String: String] {
+    public static func defaultEnvironment(
+        resourceURL: URL? = Bundle.main.resourceURL,
+        performanceSettings: DownloadPerformanceSettings = .balanced
+    ) -> [String: String] {
         let currentEnvironment = ProcessInfo.processInfo.environment
         var environment = [String: String]()
         for key in ["HOME", "TMPDIR", "USER", "LOGNAME", "LANG", "LC_ALL", "XDOWNLOADER_PYTHON", "XDOWNLOADER_SERVER_DIR"] {
@@ -345,17 +376,22 @@ public struct LocalBackendLauncher: Sendable {
         environment["XDL_DATABASE_PATH"] = supportDirectory.appending(path: "app.db").path
         environment["XDL_ARTIFACTS_DIR"] = artifactsDirectory.path
         environment["XDL_BACKEND_LOG_PATH"] = supportDirectory.appending(path: "backend.log").path
-        environment["XDL_PERFORMANCE_MODE"] = currentEnvironment["XDL_PERFORMANCE_MODE"] ?? "balanced"
-        environment["XDL_DOWNLOAD_WORKER_MAX_JOBS"] = currentEnvironment["XDL_DOWNLOAD_WORKER_MAX_JOBS"] ?? "2"
+        environment["XDL_PERFORMANCE_MODE"] = currentEnvironment["XDL_PERFORMANCE_MODE"] ?? performanceSettings.performanceMode.backendValue
+        environment["XDL_DOWNLOAD_WORKER_MAX_JOBS"] = currentEnvironment["XDL_DOWNLOAD_WORKER_MAX_JOBS"] ?? String(performanceSettings.simultaneousDownloadJobs)
         environment["XDL_AUDIO_SEPARATION_WORKER_MAX_JOBS"] = currentEnvironment["XDL_AUDIO_SEPARATION_WORKER_MAX_JOBS"] ?? "1"
-        environment["XDL_YTDLP_CONCURRENT_FRAGMENTS"] = currentEnvironment["XDL_YTDLP_CONCURRENT_FRAGMENTS"] ?? "4"
+        environment["XDL_YTDLP_CONCURRENT_FRAGMENTS"] = currentEnvironment["XDL_YTDLP_CONCURRENT_FRAGMENTS"] ?? String(performanceSettings.ytdlpConcurrentFragments)
         environment["XDL_YTDLP_FORMAT_STRATEGY"] = currentEnvironment["XDL_YTDLP_FORMAT_STRATEGY"] ?? "adaptive"
-        environment["XDL_FFMPEG_THREADS"] = currentEnvironment["XDL_FFMPEG_THREADS"] ?? "0"
+        environment["XDL_FFMPEG_THREADS"] = currentEnvironment["XDL_FFMPEG_THREADS"] ?? String(performanceSettings.ffmpegThreadCount)
         environment["XDL_YTDLP_EXTERNAL_DOWNLOADER"] = currentEnvironment["XDL_YTDLP_EXTERNAL_DOWNLOADER"] ?? "auto"
         environment["XDL_YTDLP_EXTERNAL_DOWNLOADER_ARGS"] = currentEnvironment["XDL_YTDLP_EXTERNAL_DOWNLOADER_ARGS"] ?? "aria2c:-x 8 -s 8 -k 1M"
-        environment["XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS"] = currentEnvironment["XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS"] ?? "4"
-        environment["XDL_DIRECT_DOWNLOAD_SEGMENT_MIN_BYTES"] = currentEnvironment["XDL_DIRECT_DOWNLOAD_SEGMENT_MIN_BYTES"] ?? "8388608"
-        environment["XDL_DIRECT_DOWNLOAD_SEGMENT_SIZE"] = currentEnvironment["XDL_DIRECT_DOWNLOAD_SEGMENT_SIZE"] ?? "4194304"
+        environment["XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS"] = currentEnvironment["XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS"] ?? String(performanceSettings.directDownloadMaxConnectionsForBackend)
+        environment["XDL_DIRECT_DOWNLOAD_SEGMENT_MIN_BYTES"] = currentEnvironment["XDL_DIRECT_DOWNLOAD_SEGMENT_MIN_BYTES"] ?? String(performanceSettings.directDownloadSegmentMinBytes)
+        environment["XDL_DIRECT_DOWNLOAD_SEGMENT_SIZE"] = currentEnvironment["XDL_DIRECT_DOWNLOAD_SEGMENT_SIZE"] ?? String(performanceSettings.directDownloadSegmentSizeBytes)
+        let downloadRateLimit = currentEnvironment["XDL_DOWNLOAD_RATE_LIMIT"]
+            ?? performanceSettings.downloadRateLimit.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !downloadRateLimit.isEmpty {
+            environment["XDL_DOWNLOAD_RATE_LIMIT"] = downloadRateLimit
+        }
         environment["XDL_YOUTUBE_COOKIES_FROM_BROWSER"] = "chrome"
         environment["XDL_YOUTUBE_REMOTE_COMPONENTS"] = "ejs:github"
         if let demucsPythonURL = demucsPythonURL(supportDirectory: supportDirectory) {

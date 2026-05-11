@@ -692,6 +692,143 @@ public enum ArtifactDownloadEvent: Sendable, Equatable {
     case finished(DownloadedArtifact)
 }
 
+public enum DownloadPerformanceMode: String, Codable, CaseIterable, Identifiable, Sendable {
+    case lowPower
+    case balanced
+    case performance
+
+    public var id: String { rawValue }
+
+    public var backendValue: String {
+        switch self {
+        case .lowPower:
+            "low_power"
+        case .balanced:
+            "balanced"
+        case .performance:
+            "performance"
+        }
+    }
+
+    public var title: String {
+        switch self {
+        case .lowPower:
+            "省电"
+        case .balanced:
+            "均衡"
+        case .performance:
+            "高速"
+        }
+    }
+}
+
+public struct DownloadPerformanceSettings: Codable, Sendable, Equatable {
+    private enum CodingKeys: String, CodingKey {
+        case performanceMode
+        case directDownloadAccelerationEnabled
+        case directDownloadMaxConnections
+        case directDownloadSegmentSizeBytes
+        case simultaneousDownloadJobs
+        case ytdlpConcurrentFragments
+        case ffmpegThreadCount
+        case downloadRateLimit
+    }
+
+    public static let balanced = DownloadPerformanceSettings()
+
+    public var performanceMode: DownloadPerformanceMode
+    public var directDownloadAccelerationEnabled: Bool
+    public var directDownloadMaxConnections: Int
+    public var directDownloadSegmentSizeBytes: Int
+    public var simultaneousDownloadJobs: Int
+    public var ytdlpConcurrentFragments: Int
+    public var ffmpegThreadCount: Int
+    public var downloadRateLimit: String
+
+    public static func defaults(for mode: DownloadPerformanceMode) -> DownloadPerformanceSettings {
+        switch mode {
+        case .lowPower:
+            DownloadPerformanceSettings(
+                performanceMode: .lowPower,
+                directDownloadAccelerationEnabled: false,
+                directDownloadMaxConnections: 1,
+                directDownloadSegmentSizeBytes: 4 * 1024 * 1024,
+                simultaneousDownloadJobs: 1,
+                ytdlpConcurrentFragments: 1,
+                ffmpegThreadCount: 1,
+                downloadRateLimit: ""
+            )
+        case .balanced:
+            .balanced
+        case .performance:
+            DownloadPerformanceSettings(
+                performanceMode: .performance,
+                directDownloadAccelerationEnabled: true,
+                directDownloadMaxConnections: 8,
+                directDownloadSegmentSizeBytes: 8 * 1024 * 1024,
+                simultaneousDownloadJobs: 4,
+                ytdlpConcurrentFragments: 8,
+                ffmpegThreadCount: 0,
+                downloadRateLimit: ""
+            )
+        }
+    }
+
+    public init(
+        performanceMode: DownloadPerformanceMode = .balanced,
+        directDownloadAccelerationEnabled: Bool = true,
+        directDownloadMaxConnections: Int = 4,
+        directDownloadSegmentSizeBytes: Int = 4 * 1024 * 1024,
+        simultaneousDownloadJobs: Int = 2,
+        ytdlpConcurrentFragments: Int = 4,
+        ffmpegThreadCount: Int = 0,
+        downloadRateLimit: String = ""
+    ) {
+        self.performanceMode = performanceMode
+        self.directDownloadAccelerationEnabled = directDownloadAccelerationEnabled
+        self.directDownloadMaxConnections = max(1, directDownloadMaxConnections)
+        self.directDownloadSegmentSizeBytes = max(1024 * 1024, directDownloadSegmentSizeBytes)
+        self.simultaneousDownloadJobs = max(1, simultaneousDownloadJobs)
+        self.ytdlpConcurrentFragments = max(1, ytdlpConcurrentFragments)
+        self.ffmpegThreadCount = max(0, ffmpegThreadCount)
+        self.downloadRateLimit = downloadRateLimit.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            performanceMode: try container.decodeIfPresent(DownloadPerformanceMode.self, forKey: .performanceMode) ?? .balanced,
+            directDownloadAccelerationEnabled: try container.decodeIfPresent(Bool.self, forKey: .directDownloadAccelerationEnabled) ?? true,
+            directDownloadMaxConnections: try container.decodeIfPresent(Int.self, forKey: .directDownloadMaxConnections) ?? 4,
+            directDownloadSegmentSizeBytes: try container.decodeIfPresent(Int.self, forKey: .directDownloadSegmentSizeBytes) ?? 4 * 1024 * 1024,
+            simultaneousDownloadJobs: try container.decodeIfPresent(Int.self, forKey: .simultaneousDownloadJobs) ?? 2,
+            ytdlpConcurrentFragments: try container.decodeIfPresent(Int.self, forKey: .ytdlpConcurrentFragments) ?? 4,
+            ffmpegThreadCount: try container.decodeIfPresent(Int.self, forKey: .ffmpegThreadCount) ?? 0,
+            downloadRateLimit: try container.decodeIfPresent(String.self, forKey: .downloadRateLimit) ?? ""
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(performanceMode, forKey: .performanceMode)
+        try container.encode(directDownloadAccelerationEnabled, forKey: .directDownloadAccelerationEnabled)
+        try container.encode(directDownloadMaxConnections, forKey: .directDownloadMaxConnections)
+        try container.encode(directDownloadSegmentSizeBytes, forKey: .directDownloadSegmentSizeBytes)
+        try container.encode(simultaneousDownloadJobs, forKey: .simultaneousDownloadJobs)
+        try container.encode(ytdlpConcurrentFragments, forKey: .ytdlpConcurrentFragments)
+        try container.encode(ffmpegThreadCount, forKey: .ffmpegThreadCount)
+        try container.encode(downloadRateLimit, forKey: .downloadRateLimit)
+    }
+
+    public var directDownloadSegmentMinBytes: Int {
+        max(8 * 1024 * 1024, directDownloadSegmentSizeBytes * 2)
+    }
+
+    public var directDownloadMaxConnectionsForBackend: Int {
+        directDownloadAccelerationEnabled ? directDownloadMaxConnections : 1
+    }
+}
+
 public struct AppSettings: Codable, Sendable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case apiBaseURL
@@ -700,6 +837,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         case localBackendSecret
         case bootstrapCode
         case autoSaveCompletedArtifactsToPhotos
+        case downloadPerformance
     }
 
     public var apiBaseURL: URL
@@ -708,6 +846,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
     public var localBackendSecret: String
     public var bootstrapCode: String?
     public var autoSaveCompletedArtifactsToPhotos: Bool
+    public var downloadPerformance: DownloadPerformanceSettings
 
     public init(
         apiBaseURL: URL = URL(string: "http://127.0.0.1:8000")!,
@@ -715,7 +854,8 @@ public struct AppSettings: Codable, Sendable, Equatable {
         preferredQuality: String? = nil,
         localBackendSecret: String = "",
         bootstrapCode: String? = nil,
-        autoSaveCompletedArtifactsToPhotos: Bool = false
+        autoSaveCompletedArtifactsToPhotos: Bool = false,
+        downloadPerformance: DownloadPerformanceSettings = .balanced
     ) {
         self.apiBaseURL = apiBaseURL
         self.autoPasteEnabled = autoPasteEnabled
@@ -723,6 +863,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         self.localBackendSecret = localBackendSecret
         self.bootstrapCode = bootstrapCode
         self.autoSaveCompletedArtifactsToPhotos = autoSaveCompletedArtifactsToPhotos
+        self.downloadPerformance = downloadPerformance
     }
 
     public init(from decoder: Decoder) throws {
@@ -733,5 +874,6 @@ public struct AppSettings: Codable, Sendable, Equatable {
         self.localBackendSecret = try container.decodeIfPresent(String.self, forKey: .localBackendSecret) ?? ""
         self.bootstrapCode = try container.decodeIfPresent(String.self, forKey: .bootstrapCode)
         self.autoSaveCompletedArtifactsToPhotos = try container.decodeIfPresent(Bool.self, forKey: .autoSaveCompletedArtifactsToPhotos) ?? false
+        self.downloadPerformance = try container.decodeIfPresent(DownloadPerformanceSettings.self, forKey: .downloadPerformance) ?? .balanced
     }
 }

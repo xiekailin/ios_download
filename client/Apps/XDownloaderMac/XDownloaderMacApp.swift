@@ -67,8 +67,12 @@ struct XDownloaderMacApp: App {
     @State private var logsLoadErrorMessage: String?
     @State private var artifactActionMessage: String?
     @State private var isLogSectionExpanded = false
+    @State private var settingsSaveMessage: String?
+    @State private var isRestartingBackend = false
     private static let localSettings = makeLocalSettings()
     private static let localSecret = localSettings.localBackendSecret
+    private static let localBaseURL = URL(string: "http://127.0.0.1:18767")!
+    private let settingsRepository = LocalAppSettingsRepository()
     private let fileExporter = FileExportAdapter()
     private let controller = AppController(
         apiClient: APIClient(baseURL: Self.localSettings.apiBaseURL, localSecret: Self.localSecret),
@@ -123,18 +127,76 @@ struct XDownloaderMacApp: App {
     }
 
     private static func makeLocalSettings() -> AppSettings {
+        let repository = LocalAppSettingsRepository()
+        var settings = (try? repository.loadSettings()) ?? AppSettings()
         let supportDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appending(path: "XDownloader", directoryHint: .isDirectory)
         let secretURL = supportDirectory.appending(path: "local_backend_secret")
         if let secret = try? String(contentsOf: secretURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !secret.isEmpty {
             try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: secretURL.path)
-            return AppSettings(apiBaseURL: URL(string: "http://127.0.0.1:18767")!, localBackendSecret: secret)
+            settings.apiBaseURL = localBaseURL
+            settings.localBackendSecret = secret
+            try? repository.saveSettings(settings)
+            return settings
         }
-        let secret = LocalBackendLauncher.makeLocalSecret()
+        let secret = settings.localBackendSecret.isEmpty ? LocalBackendLauncher.makeLocalSecret() : settings.localBackendSecret
         try? FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
         try? secret.write(to: secretURL, atomically: true, encoding: .utf8)
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: secretURL.path)
-        return AppSettings(apiBaseURL: URL(string: "http://127.0.0.1:18767")!, localBackendSecret: secret)
+        settings.apiBaseURL = localBaseURL
+        settings.localBackendSecret = secret
+        try? repository.saveSettings(settings)
+        return settings
+    }
+
+    private var downloadPerformanceBinding: Binding<DownloadPerformanceSettings> {
+        Binding(
+            get: { store.settings.downloadPerformance },
+            set: { saveDownloadPerformanceSettings($0) }
+        )
+    }
+
+    private func makeLocalBackendLauncher() -> LocalBackendLauncher {
+        LocalBackendLauncher(
+            environment: LocalBackendLauncher.defaultEnvironment(performanceSettings: store.settings.downloadPerformance),
+            localSecret: store.settings.localBackendSecret
+        )
+    }
+
+    private func saveDownloadPerformanceSettings(_ performance: DownloadPerformanceSettings) {
+        var settings = store.settings
+        settings.apiBaseURL = Self.localBaseURL
+        settings.localBackendSecret = Self.localSecret
+        settings.downloadPerformance = performance
+        do {
+            try settingsRepository.saveSettings(settings)
+            store.setSettings(settings)
+            settingsSaveMessage = "已保存，重启后端后生效。"
+        } catch {
+            store.setError("保存设置失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func resetDownloadPerformanceSettings() {
+        saveDownloadPerformanceSettings(.balanced)
+    }
+
+    private func restartBackendForCurrentSettings() {
+        Task {
+            isRestartingBackend = true
+            defer { isRestartingBackend = false }
+            do {
+                let status = try await makeLocalBackendLauncher().restartAndCheckHealth()
+                store.setBackendHealthStatus(status)
+                if status == .healthy {
+                    settingsSaveMessage = "后端已重启，配置已生效。"
+                    store.setError(nil)
+                }
+            } catch {
+                store.setBackendHealthStatus(.unhealthy)
+                store.setError(error.localizedDescription)
+            }
+        }
     }
 
     private func selectAudioFileForSeparation() {
@@ -159,9 +221,8 @@ struct XDownloaderMacApp: App {
     }
 
     private func ensureBackendConnection(reportsErrors: Bool) async {
-        let launcher = LocalBackendLauncher(localSecret: Self.localSecret)
         do {
-            let status = try await launcher.startAndCheckHealth()
+            let status = try await makeLocalBackendLauncher().startAndCheckHealth()
             store.setBackendHealthStatus(status)
             if status == .healthy {
                 store.setError(nil)
@@ -179,8 +240,7 @@ struct XDownloaderMacApp: App {
             await ensureBackendConnection(reportsErrors: true)
             return
         }
-        let launcher = LocalBackendLauncher(localSecret: Self.localSecret)
-        let status = await launcher.checkHealth()
+        let status = await makeLocalBackendLauncher().checkHealth()
         store.setBackendHealthStatus(status)
         if status == .healthy {
             store.setError(nil)
@@ -1109,6 +1169,14 @@ struct XDownloaderMacApp: App {
             .toolbar {
                 ToolbarItemGroup(placement: .primaryAction) {
                     Button {
+                        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+                    } label: {
+                        Label("设置", systemImage: "gearshape")
+                            .labelStyle(.iconOnly)
+                    }
+                    .accessibilityLabel("设置")
+
+                    Button {
                         Task { await controller.refreshJobs(store: store) }
                     } label: {
                         Label("刷新素材库", systemImage: "arrow.clockwise")
@@ -1232,5 +1300,113 @@ struct XDownloaderMacApp: App {
                 await loadJobLogs(for: visibleSelectedJob)
             }
         }
+
+        Settings {
+            MacDownloadPerformanceSettingsView(
+                performance: downloadPerformanceBinding,
+                statusMessage: settingsSaveMessage,
+                isRestartingBackend: isRestartingBackend,
+                resetToBalanced: resetDownloadPerformanceSettings,
+                restartBackend: restartBackendForCurrentSettings
+            )
+        }
+    }
+}
+
+private struct MacDownloadPerformanceSettingsView: View {
+    @Binding var performance: DownloadPerformanceSettings
+    let statusMessage: String?
+    let isRestartingBackend: Bool
+    let resetToBalanced: () -> Void
+    let restartBackend: () -> Void
+
+    private let jobOptions = [1, 2, 3, 4]
+    private let connectionOptions = [1, 4, 8, 16]
+    private let fragmentOptions = [1, 4, 8, 16]
+    private let segmentSizeOptions = [4 * 1024 * 1024, 8 * 1024 * 1024, 16 * 1024 * 1024]
+    private let ffmpegThreadOptions = [0, 1, 2, 4, 8]
+
+    var body: some View {
+        Form {
+            Section("下载与性能") {
+                Picker("性能模式", selection: $performance.performanceMode) {
+                    ForEach(DownloadPerformanceMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: performance.performanceMode) { _, mode in
+                    performance = DownloadPerformanceSettings.defaults(for: mode)
+                }
+
+                Picker("同时下载任务", selection: $performance.simultaneousDownloadJobs) {
+                    ForEach(jobOptions, id: \.self) { value in
+                        Text("\(value)").tag(value)
+                    }
+                }
+
+                Toggle("直连分片下载", isOn: $performance.directDownloadAccelerationEnabled)
+
+                Picker("直连连接数", selection: $performance.directDownloadMaxConnections) {
+                    ForEach(connectionOptions, id: \.self) { value in
+                        Text("\(value)").tag(value)
+                    }
+                }
+                .disabled(!performance.directDownloadAccelerationEnabled)
+
+                Picker("分片大小", selection: $performance.directDownloadSegmentSizeBytes) {
+                    ForEach(segmentSizeOptions, id: \.self) { value in
+                        Text(byteSizeTitle(value)).tag(value)
+                    }
+                }
+                .disabled(!performance.directDownloadAccelerationEnabled)
+
+                Picker("yt-dlp 分片", selection: $performance.ytdlpConcurrentFragments) {
+                    ForEach(fragmentOptions, id: \.self) { value in
+                        Text("\(value)").tag(value)
+                    }
+                }
+
+                Picker("合并与转码线程", selection: $performance.ffmpegThreadCount) {
+                    ForEach(ffmpegThreadOptions, id: \.self) { value in
+                        Text(value == 0 ? "自动" : "\(value)").tag(value)
+                    }
+                }
+
+                TextField("速度限制", text: $performance.downloadRateLimit, prompt: Text("不限"))
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            Section {
+                HStack {
+                    Button("恢复均衡默认值", action: resetToBalanced)
+                    Spacer()
+                    Button {
+                        restartBackend()
+                    } label: {
+                        if isRestartingBackend {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Text("应用并重启后端")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isRestartingBackend)
+                }
+                if let statusMessage {
+                    Text(statusMessage)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .padding(22)
+        .frame(width: 520)
+    }
+
+    private func byteSizeTitle(_ value: Int) -> String {
+        "\(value / 1024 / 1024) MB"
     }
 }

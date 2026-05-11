@@ -40,6 +40,29 @@ import Testing
     #expect(loaded.autoSaveCompletedArtifactsToPhotos)
 }
 
+@Test func localAppSettingsRepositoryPersistsDownloadPerformanceSettings() async throws {
+    let url = FileManager.default.temporaryDirectory.appending(path: "xdl-settings-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: url) }
+    let repository = LocalAppSettingsRepository(storageURL: url)
+    let settings = AppSettings(
+        downloadPerformance: DownloadPerformanceSettings(
+            performanceMode: .performance,
+            directDownloadAccelerationEnabled: true,
+            directDownloadMaxConnections: 8,
+            directDownloadSegmentSizeBytes: 8 * 1024 * 1024,
+            simultaneousDownloadJobs: 3,
+            ytdlpConcurrentFragments: 8,
+            ffmpegThreadCount: 4,
+            downloadRateLimit: "5M"
+        )
+    )
+
+    try repository.saveSettings(settings)
+    let loaded = try repository.loadSettings()
+
+    #expect(loaded.downloadPerformance == settings.downloadPerformance)
+}
+
 @Test func localAppSettingsRepositoryKeepsCustomStorageFilesIsolated() async throws {
     let localURL = FileManager.default.temporaryDirectory.appending(path: "xdl-local-settings-\(UUID().uuidString).json")
     let cloudURL = FileManager.default.temporaryDirectory.appending(path: "xdl-cloud-settings-\(UUID().uuidString).json")

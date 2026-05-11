@@ -732,4 +732,46 @@ struct LocalBackendLauncherTests {
     #expect(environment["XDL_DIRECT_DOWNLOAD_SEGMENT_MIN_BYTES"] == "8388608")
     #expect(environment["XDL_DIRECT_DOWNLOAD_SEGMENT_SIZE"] == "4194304")
 }
+
+@Test func localBackendLauncherAppliesCustomDownloadPerformanceSettings() {
+    let performance = DownloadPerformanceSettings(
+        performanceMode: .performance,
+        directDownloadAccelerationEnabled: true,
+        directDownloadMaxConnections: 8,
+        directDownloadSegmentSizeBytes: 8 * 1024 * 1024,
+        simultaneousDownloadJobs: 3,
+        ytdlpConcurrentFragments: 8,
+        ffmpegThreadCount: 4,
+        downloadRateLimit: "5M"
+    )
+
+    let environment = LocalBackendLauncher.defaultEnvironment(performanceSettings: performance)
+
+    #expect(environment["XDL_PERFORMANCE_MODE"] == "performance")
+    #expect(environment["XDL_DOWNLOAD_WORKER_MAX_JOBS"] == "3")
+    #expect(environment["XDL_YTDLP_CONCURRENT_FRAGMENTS"] == "8")
+    #expect(environment["XDL_FFMPEG_THREADS"] == "4")
+    #expect(environment["XDL_DOWNLOAD_RATE_LIMIT"] == "5M")
+    #expect(environment["XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS"] == "8")
+    #expect(environment["XDL_DIRECT_DOWNLOAD_SEGMENT_MIN_BYTES"] == "16777216")
+    #expect(environment["XDL_DIRECT_DOWNLOAD_SEGMENT_SIZE"] == "8388608")
+}
+
+@Test func localBackendLauncherDisablesDirectDownloadAccelerationWhenRequested() {
+    let performance = DownloadPerformanceSettings(
+        performanceMode: .balanced,
+        directDownloadAccelerationEnabled: false,
+        directDownloadMaxConnections: 8,
+        directDownloadSegmentSizeBytes: 4 * 1024 * 1024,
+        simultaneousDownloadJobs: 2,
+        ytdlpConcurrentFragments: 4,
+        ffmpegThreadCount: 0,
+        downloadRateLimit: ""
+    )
+
+    let environment = LocalBackendLauncher.defaultEnvironment(performanceSettings: performance)
+
+    #expect(environment["XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS"] == "1")
+    #expect(environment["XDL_DIRECT_DOWNLOAD_SEGMENT_SIZE"] == "4194304")
+}
 }
