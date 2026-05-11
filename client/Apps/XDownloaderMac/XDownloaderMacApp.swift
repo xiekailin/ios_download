@@ -590,6 +590,41 @@ struct XDownloaderMacApp: App {
         .padding(.vertical, 12)
     }
 
+    private func failureRecoveryAdviceCard(_ advice: FailureRecoveryAdvice) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "wrench.and.screwdriver.fill")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.red)
+                .frame(width: 22, height: 22)
+                .background(Color.red.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(advice.title)
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+
+                Text(advice.detail)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Label(advice.actionTitle, systemImage: "arrow.clockwise")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.red)
+                    .labelStyle(.titleAndIcon)
+                    .padding(.top, 2)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.red.opacity(0.05), in: RoundedRectangle(cornerRadius: MacNativeStyle.cornerRadius))
+        .overlay(
+            RoundedRectangle(cornerRadius: MacNativeStyle.cornerRadius)
+                .stroke(Color.red.opacity(0.18), lineWidth: 1)
+        )
+    }
+
     private func jobLogsSection(for job: Job) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
@@ -1084,6 +1119,13 @@ struct XDownloaderMacApp: App {
 
             inspectorSection("任务进度", systemImage: "gauge.with.dots.needle.bottom.50percent") {
                 DownloadProgressDetails(job: job)
+            }
+
+            if let advice = job.failureRecoveryAdvice {
+                Divider()
+                inspectorSection("诊断建议", systemImage: "stethoscope") {
+                    failureRecoveryAdviceCard(advice)
+                }
             }
 
             if job.status == .completed {

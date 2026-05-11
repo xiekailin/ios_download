@@ -43,6 +43,7 @@ class YtDlpProviderTests(unittest.TestCase):
     def test_ytdlp_user_message_maps_common_errors(self) -> None:
         cases = [
             ("[youtube] Sign in to confirm you're not a bot", "该平台需要登录验证。请在 Mac 端上传已登录平台的 Cookie 后重试。"),
+            ("HTTP Error 429: Too Many Requests", "平台正在限流，已自动降速重试；仍失败时请稍后再试。"),
             ("requested format not available", "当前视频格式不可用，请稍后重试。"),
             ("This video is private", "该视频不可访问，可能已被删除、设为私密或需要权限。"),
             ("The uploader has not made this video available", "该视频不可访问，可能已被删除、设为私密或需要权限。"),

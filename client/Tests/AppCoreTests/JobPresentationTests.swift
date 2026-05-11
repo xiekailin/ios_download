@@ -56,6 +56,36 @@ private func makePresentationJob(
     #expect(job.secondaryStatusText == "任务失败，请重试。")
 }
 
+@Test func failedJobRecoveryAdviceClassifiesRateLimit() {
+    let job = makePresentationJob(status: .failed, errorMessage: "HTTP Error 429: Too Many Requests")
+
+    #expect(job.failureRecoveryAdvice?.title == "平台正在限流")
+    #expect(job.failureRecoveryAdvice?.detail.contains("稍后") == true)
+    #expect(job.failureRecoveryAdvice?.actionTitle == "稍后重试")
+}
+
+@Test func failedJobRecoveryAdviceClassifiesLoginVerification() {
+    let job = makePresentationJob(status: .failed, errorMessage: "Sign in to confirm you're not a bot")
+
+    #expect(job.failureRecoveryAdvice?.title == "需要登录验证")
+    #expect(job.failureRecoveryAdvice?.detail.contains("Cookie") == true)
+    #expect(job.failureRecoveryAdvice?.actionTitle == "配置 Cookie 后重试")
+}
+
+@Test func failedJobRecoveryAdviceClassifiesDiskSpace() {
+    let job = makePresentationJob(status: .failed, errorMessage: "No space left on device")
+
+    #expect(job.failureRecoveryAdvice?.title == "磁盘空间不足")
+    #expect(job.failureRecoveryAdvice?.detail.contains("释放") == true)
+    #expect(job.failureRecoveryAdvice?.actionTitle == "清理空间后重试")
+}
+
+@Test func activeJobDoesNotShowRecoveryAdvice() {
+    let job = makePresentationJob(status: .downloading, errorMessage: "HTTP Error 429: Too Many Requests")
+
+    #expect(job.failureRecoveryAdvice == nil)
+}
+
 @Test func canceledJobDisplayErrorTextIsFriendly() {
     let job = makePresentationJob(status: .canceled)
 

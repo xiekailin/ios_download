@@ -36,6 +36,8 @@ def ytdlp_user_message(error_text: str, *, retried_with_cookie: bool = False) ->
         if retried_with_cookie:
             return "该平台需要登录验证。已自动尝试使用已配置的登录 Cookie，请确认 Cookie 有效后重试。"
         return "该平台需要登录验证。请在 Mac 端上传已登录平台的 Cookie 后重试。"
+    if "http error 429" in lowered or "too many requests" in lowered or "rate limit" in lowered:
+        return "平台正在限流，已自动降速重试；仍失败时请稍后再试。"
     if "requested format" in lowered or "format is not available" in lowered or "no video formats" in lowered:
         return "当前视频格式不可用，请稍后重试。"
     if "private" in lowered or "unavailable" in lowered or "has been removed" in lowered or "made this video available" in lowered or ("not available" in lowered and "format" not in lowered):
