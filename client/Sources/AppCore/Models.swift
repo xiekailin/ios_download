@@ -14,6 +14,7 @@ public enum JobStatus: String, Codable, Sendable, CaseIterable {
     case downloading
     case muxing
     case storing
+    case paused
     case completed
     case failed
     case canceled
@@ -43,6 +44,8 @@ public enum JobStatus: String, Codable, Sendable, CaseIterable {
             "处理中"
         case .storing:
             "保存中"
+        case .paused:
+            "已暂停"
         case .completed:
             "已完成"
         case .failed:
@@ -66,6 +69,8 @@ public enum JobStatus: String, Codable, Sendable, CaseIterable {
             "link.badge.plus"
         case .muxing, .storing:
             "gearshape.fill"
+        case .paused:
+            "pause.circle.fill"
         case .created, .queued:
             "clock.fill"
         }
@@ -330,6 +335,7 @@ public struct Job: Codable, Identifiable, Sendable, Equatable {
         case jobType
         case status
         case progress
+        case priority
         case downloadedBytes
         case totalBytes
         case speedBytesPerSec
@@ -355,6 +361,7 @@ public struct Job: Codable, Identifiable, Sendable, Equatable {
     public let jobType: JobType
     public let status: JobStatus
     public let progress: Int
+    public let priority: Int
     public let downloadedBytes: Int?
     public let totalBytes: Int?
     public let speedBytesPerSec: Int?
@@ -380,6 +387,7 @@ public struct Job: Codable, Identifiable, Sendable, Equatable {
         jobType: JobType = .download,
         status: JobStatus,
         progress: Int,
+        priority: Int = 0,
         downloadedBytes: Int? = nil,
         totalBytes: Int? = nil,
         speedBytesPerSec: Int? = nil,
@@ -404,6 +412,7 @@ public struct Job: Codable, Identifiable, Sendable, Equatable {
         self.jobType = jobType
         self.status = status
         self.progress = progress
+        self.priority = priority
         self.downloadedBytes = downloadedBytes
         self.totalBytes = totalBytes
         self.speedBytesPerSec = speedBytesPerSec
@@ -431,6 +440,7 @@ public struct Job: Codable, Identifiable, Sendable, Equatable {
         self.jobType = try container.decodeIfPresent(JobType.self, forKey: .jobType) ?? .download
         self.status = try container.decode(JobStatus.self, forKey: .status)
         self.progress = try container.decode(Int.self, forKey: .progress)
+        self.priority = try container.decodeIfPresent(Int.self, forKey: .priority) ?? 0
         self.downloadedBytes = try container.decodeIfPresent(Int.self, forKey: .downloadedBytes)
         self.totalBytes = try container.decodeIfPresent(Int.self, forKey: .totalBytes)
         self.speedBytesPerSec = try container.decodeIfPresent(Int.self, forKey: .speedBytesPerSec)
@@ -640,6 +650,9 @@ public struct Job: Codable, Identifiable, Sendable, Equatable {
     public var secondaryStatusText: String {
         if let displayErrorText {
             return displayErrorText
+        }
+        if status == .paused {
+            return "任务已暂停，点击继续后会重新进入队列。"
         }
         if let downloadedSummaryText {
             return downloadedSummaryText
@@ -894,6 +907,9 @@ public struct DownloadPerformanceSettings: Codable, Sendable, Equatable {
         case ytdlpConcurrentFragments
         case ffmpegThreadCount
         case downloadRateLimit
+        case nightDownloadEnabled
+        case nightDownloadStartHour
+        case nightDownloadEndHour
     }
 
     public static let balanced = DownloadPerformanceSettings()
@@ -906,6 +922,9 @@ public struct DownloadPerformanceSettings: Codable, Sendable, Equatable {
     public var ytdlpConcurrentFragments: Int
     public var ffmpegThreadCount: Int
     public var downloadRateLimit: String
+    public var nightDownloadEnabled: Bool
+    public var nightDownloadStartHour: Int
+    public var nightDownloadEndHour: Int
 
     public static func defaults(for mode: DownloadPerformanceMode) -> DownloadPerformanceSettings {
         switch mode {
@@ -980,6 +999,9 @@ public struct DownloadPerformanceSettings: Codable, Sendable, Equatable {
         guard performanceMode == .automatic else { return self }
         var settings = Self.automaticDefaultsForCurrentDevice(isExternalPowerConnected: isExternalPowerConnected)
         settings.downloadRateLimit = downloadRateLimit
+        settings.nightDownloadEnabled = nightDownloadEnabled
+        settings.nightDownloadStartHour = nightDownloadStartHour
+        settings.nightDownloadEndHour = nightDownloadEndHour
         return settings
     }
 
@@ -991,7 +1013,10 @@ public struct DownloadPerformanceSettings: Codable, Sendable, Equatable {
         simultaneousDownloadJobs: Int = 2,
         ytdlpConcurrentFragments: Int = 4,
         ffmpegThreadCount: Int = 0,
-        downloadRateLimit: String = ""
+        downloadRateLimit: String = "",
+        nightDownloadEnabled: Bool = false,
+        nightDownloadStartHour: Int = 23,
+        nightDownloadEndHour: Int = 7
     ) {
         self.performanceMode = performanceMode
         self.directDownloadAccelerationEnabled = directDownloadAccelerationEnabled
@@ -1001,6 +1026,9 @@ public struct DownloadPerformanceSettings: Codable, Sendable, Equatable {
         self.ytdlpConcurrentFragments = max(1, ytdlpConcurrentFragments)
         self.ffmpegThreadCount = max(0, ffmpegThreadCount)
         self.downloadRateLimit = downloadRateLimit.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.nightDownloadEnabled = nightDownloadEnabled
+        self.nightDownloadStartHour = min(23, max(0, nightDownloadStartHour))
+        self.nightDownloadEndHour = min(23, max(0, nightDownloadEndHour))
     }
 
     public init(from decoder: Decoder) throws {
@@ -1013,7 +1041,10 @@ public struct DownloadPerformanceSettings: Codable, Sendable, Equatable {
             simultaneousDownloadJobs: try container.decodeIfPresent(Int.self, forKey: .simultaneousDownloadJobs) ?? 2,
             ytdlpConcurrentFragments: try container.decodeIfPresent(Int.self, forKey: .ytdlpConcurrentFragments) ?? 4,
             ffmpegThreadCount: try container.decodeIfPresent(Int.self, forKey: .ffmpegThreadCount) ?? 0,
-            downloadRateLimit: try container.decodeIfPresent(String.self, forKey: .downloadRateLimit) ?? ""
+            downloadRateLimit: try container.decodeIfPresent(String.self, forKey: .downloadRateLimit) ?? "",
+            nightDownloadEnabled: try container.decodeIfPresent(Bool.self, forKey: .nightDownloadEnabled) ?? false,
+            nightDownloadStartHour: try container.decodeIfPresent(Int.self, forKey: .nightDownloadStartHour) ?? 23,
+            nightDownloadEndHour: try container.decodeIfPresent(Int.self, forKey: .nightDownloadEndHour) ?? 7
         )
     }
 
@@ -1027,6 +1058,9 @@ public struct DownloadPerformanceSettings: Codable, Sendable, Equatable {
         try container.encode(ytdlpConcurrentFragments, forKey: .ytdlpConcurrentFragments)
         try container.encode(ffmpegThreadCount, forKey: .ffmpegThreadCount)
         try container.encode(downloadRateLimit, forKey: .downloadRateLimit)
+        try container.encode(nightDownloadEnabled, forKey: .nightDownloadEnabled)
+        try container.encode(nightDownloadStartHour, forKey: .nightDownloadStartHour)
+        try container.encode(nightDownloadEndHour, forKey: .nightDownloadEndHour)
     }
 
     public var directDownloadSegmentMinBytes: Int {

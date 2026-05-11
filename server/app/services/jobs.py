@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 import re
 import threading
 import uuid
+from urllib.parse import urlsplit
 
 from app.core.config import Settings
 from app.core.errors import ConflictAppError, NotFoundAppError
@@ -24,6 +26,7 @@ _ACTIVE_JOB_STATUSES = {
     JobStatus.DOWNLOADING,
     JobStatus.MUXING,
     JobStatus.STORING,
+    JobStatus.PAUSED,
 }
 
 
@@ -62,16 +65,28 @@ class BackgroundJobRunner:
     _audio_separation_executor: ThreadPoolExecutor = field(init=False)
     _lock: threading.Lock = field(init=False)
     _running_job_ids: set[str] = field(init=False)
+    _running_job_types: dict[str, JobType] = field(init=False)
+    _running_platform_keys: dict[str, str] = field(init=False)
+    _on_job_finished: object | None = field(init=False, default=None)
+    _download_max_jobs: int = field(init=False)
+    _audio_max_jobs: int = field(init=False)
 
     def __post_init__(self) -> None:
         download_max_jobs = self.download_max_jobs if self.download_max_jobs is not None else self.max_jobs
-        self._download_executor = ThreadPoolExecutor(max_workers=max(1, download_max_jobs), thread_name_prefix="xdl-download")
+        self._download_max_jobs = max(1, download_max_jobs)
+        self._audio_max_jobs = max(1, self.audio_separation_max_jobs)
+        self._download_executor = ThreadPoolExecutor(max_workers=self._download_max_jobs, thread_name_prefix="xdl-download")
         self._audio_separation_executor = ThreadPoolExecutor(
-            max_workers=max(1, self.audio_separation_max_jobs),
+            max_workers=self._audio_max_jobs,
             thread_name_prefix="xdl-heavy",
         )
         self._lock = threading.Lock()
         self._running_job_ids = set()
+        self._running_job_types = {}
+        self._running_platform_keys = {}
+
+    def set_on_job_finished(self, callback: object | None) -> None:
+        self._on_job_finished = callback
 
     def dispatch(self, job_id: str, *, job_type: JobType = JobType.DOWNLOAD) -> bool:
         if not self.enabled:
@@ -80,6 +95,33 @@ class BackgroundJobRunner:
             if job_id in self._running_job_ids:
                 return False
             self._running_job_ids.add(job_id)
+            self._running_job_types[job_id] = job_type
+        self._executor_for(job_type).submit(self._run_job, job_id)
+        return True
+
+    def dispatch_if_available(
+        self,
+        job_id: str,
+        *,
+        job_type: JobType = JobType.DOWNLOAD,
+        platform_key: str | None = None,
+        platform_limit: int | None = None,
+    ) -> bool:
+        if not self.enabled:
+            return False
+        with self._lock:
+            if job_id in self._running_job_ids:
+                return False
+            if self._running_count(job_type) >= self._capacity(job_type):
+                return False
+            if platform_key and platform_limit is not None and platform_limit > 0:
+                running_for_platform = sum(1 for value in self._running_platform_keys.values() if value == platform_key)
+                if running_for_platform >= platform_limit:
+                    return False
+            self._running_job_ids.add(job_id)
+            self._running_job_types[job_id] = job_type
+            if platform_key:
+                self._running_platform_keys[job_id] = platform_key
         self._executor_for(job_type).submit(self._run_job, job_id)
         return True
 
@@ -94,6 +136,19 @@ class BackgroundJobRunner:
         finally:
             with self._lock:
                 self._running_job_ids.discard(job_id)
+                self._running_job_types.pop(job_id, None)
+                self._running_platform_keys.pop(job_id, None)
+            callback = self._on_job_finished
+            if callable(callback):
+                callback()
+
+    def _capacity(self, job_type: JobType) -> int:
+        if job_type == JobType.AUDIO_SEPARATION:
+            return self._audio_max_jobs
+        return self._download_max_jobs
+
+    def _running_count(self, job_type: JobType) -> int:
+        return sum(1 for value in self._running_job_types.values() if value == job_type)
 
     def close(self, *, wait: bool = True) -> None:
         self._download_executor.shutdown(wait=wait, cancel_futures=not wait)
@@ -116,13 +171,29 @@ class JobService:
         self._events = events
         self._settings = settings
         self._selector = selector
+        self._queue_wakeup_stop = threading.Event()
+        self._queue_wakeup_thread: threading.Thread | None = None
+        if hasattr(self._runner, "set_on_job_finished"):
+            self._runner.set_on_job_finished(self.dispatch_queued)
+        if self._settings.queue_night_download_enabled:
+            self._queue_wakeup_thread = threading.Thread(
+                target=self._queue_wakeup_loop,
+                name="xdl-queue-wakeup",
+                daemon=True,
+            )
+            self._queue_wakeup_thread.start()
 
     def close(self) -> None:
+        self._queue_wakeup_stop.set()
+        if self._queue_wakeup_thread is not None:
+            self._queue_wakeup_thread.join(timeout=1)
         self._runner.close(wait=True)
 
     def recover_interrupted_jobs(self) -> int:
         recovered_count = 0
         for job in self._repository.list_active():
+            if job.status == JobStatus.PAUSED:
+                continue
             if job.status != JobStatus.QUEUED:
                 self._repository.update_status(
                     job.id,
@@ -139,7 +210,7 @@ class JobService:
                 )
                 self.record_event(job.id, level="warning", event_type="recovered", message="后端重启后恢复任务，已重新加入队列")
                 recovered_count += 1
-            self._runner.dispatch(job.id, job_type=job.job_type)
+        self.dispatch_queued()
         return recovered_count
 
     def create(self, *, device: Device, source_url: str, preferred_quality: str | None) -> Job:
@@ -208,7 +279,7 @@ class JobService:
                 raise ConflictAppError("active job state changed", "相同链接已有任务在处理中。") from exc
             return active_job
         self.record_event(job.id, level="info", event_type="queued", message="任务已加入队列")
-        self._runner.dispatch(job.id, job_type=job.job_type)
+        self.dispatch_queued()
         return self._repository.get(job.id) or job
 
     def create_audio_separation(self, *, device: Device, file_name: str, content: bytes) -> Job:
@@ -234,7 +305,7 @@ class JobService:
             media_title=stem,
         )
         self.record_event(job.id, level="info", event_type="queued", message="任务已加入队列")
-        self._runner.dispatch(job.id, job_type=job.job_type)
+        self.dispatch_queued()
         return self._repository.get(job.id) or job
 
     def list_artifacts(self, job_id: str, device: Device):
@@ -298,7 +369,70 @@ class JobService:
             user_message=None,
             finished_at=None,
         )
-        self._runner.dispatch(job.id, job_type=job.job_type)
+        self.dispatch_queued()
+        return self.get_owned(job.id, device)
+
+    def retry_many(self, device: Device) -> list[Job]:
+        retryable = [job for job in self._repository.list_for_device(device.id) if job.status in {JobStatus.FAILED, JobStatus.CANCELED}]
+        for job in retryable:
+            self.record_event(job.id, level="info", event_type="retry", message="任务重新加入队列")
+            self._repository.update_status(
+                job.id,
+                status=JobStatus.QUEUED,
+                progress=0,
+                downloaded_bytes=None,
+                total_bytes=None,
+                speed_bytes_per_sec=None,
+                eta_seconds=None,
+                error_code=None,
+                error_message=None,
+                user_message=None,
+                finished_at=None,
+            )
+        self.dispatch_queued()
+        return [self.get_owned(job.id, device) for job in retryable]
+
+    def pause(self, job_id: str, device: Device) -> Job:
+        job = self.get_owned(job_id, device)
+        if job.status != JobStatus.QUEUED:
+            raise ConflictAppError("job is not pauseable", "只有排队中的任务可以暂停。")
+        self.record_event(job.id, level="info", event_type="paused", message="任务已暂停")
+        self._repository.update_status(
+            job.id,
+            status=JobStatus.PAUSED,
+            progress=job.progress,
+            downloaded_bytes=job.downloaded_bytes,
+            total_bytes=job.total_bytes,
+            speed_bytes_per_sec=job.speed_bytes_per_sec,
+            eta_seconds=job.eta_seconds,
+        )
+        return self.get_owned(job.id, device)
+
+    def resume(self, job_id: str, device: Device) -> Job:
+        job = self.get_owned(job_id, device)
+        if job.status != JobStatus.PAUSED:
+            raise ConflictAppError("job is not paused", "只有已暂停的任务可以继续。")
+        self.record_event(job.id, level="info", event_type="resumed", message="任务已继续")
+        self._repository.update_status(
+            job.id,
+            status=JobStatus.QUEUED,
+            progress=job.progress,
+            downloaded_bytes=job.downloaded_bytes,
+            total_bytes=job.total_bytes,
+            speed_bytes_per_sec=job.speed_bytes_per_sec,
+            eta_seconds=job.eta_seconds,
+        )
+        self.dispatch_queued()
+        return self.get_owned(job.id, device)
+
+    def set_priority(self, job_id: str, device: Device, priority: int) -> Job:
+        job = self.get_owned(job_id, device)
+        if job.status not in _ACTIVE_JOB_STATUSES:
+            raise ConflictAppError("job priority is not editable", "只有队列中的任务可以调整优先级。")
+        bounded_priority = max(-100, min(priority, 100))
+        self._repository.update_priority(job.id, bounded_priority)
+        self.record_event(job.id, level="info", event_type="priority", message=f"优先级已调整为 {bounded_priority}")
+        self.dispatch_queued()
         return self.get_owned(job.id, device)
 
     def cancel(self, job_id: str, device: Device) -> Job:
@@ -316,6 +450,50 @@ class JobService:
             eta_seconds=job.eta_seconds,
         )
         return self.get_owned(job.id, device)
+
+    def dispatch_queued(self) -> None:
+        if not self._is_queue_dispatch_allowed():
+            return
+        for job in self._repository.list_queued_for_dispatch():
+            self._dispatch_job_if_available(job)
+
+    def _queue_wakeup_loop(self) -> None:
+        while not self._queue_wakeup_stop.wait(self._settings.queue_wakeup_interval_seconds):
+            self.dispatch_queued()
+
+    def _is_queue_dispatch_allowed(self, *, hour: int | None = None) -> bool:
+        if not self._settings.queue_night_download_enabled:
+            return True
+        current_hour = datetime.now().hour if hour is None else hour % 24
+        start_hour = self._settings.queue_night_start_hour
+        end_hour = self._settings.queue_night_end_hour
+        if start_hour == end_hour:
+            return True
+        if start_hour < end_hour:
+            return start_hour <= current_hour < end_hour
+        return current_hour >= start_hour or current_hour < end_hour
+
+    def _dispatch_job_if_available(self, job: Job) -> bool:
+        platform_key = self._platform_key(job)
+        if hasattr(self._runner, "dispatch_if_available"):
+            return self._runner.dispatch_if_available(
+                job.id,
+                job_type=job.job_type,
+                platform_key=platform_key,
+                platform_limit=self._settings.queue_platform_max_jobs,
+            )
+        return self._runner.dispatch(job.id, job_type=job.job_type)
+
+    @staticmethod
+    def _platform_key(job: Job) -> str:
+        try:
+            host = urlsplit(job.normalized_url).hostname or ""
+        except ValueError:
+            return job.provider or "local"
+        host = host.removeprefix("www.").lower()
+        if host in {"youtu.be", "youtube-nocookie.com", "m.youtube.com"}:
+            return "youtube.com"
+        return host or job.provider or "local"
 
     def delete(self, job_id: str, device: Device) -> Job:
         job = self.get_owned(job_id, device)

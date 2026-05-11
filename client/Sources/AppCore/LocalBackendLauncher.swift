@@ -387,6 +387,9 @@ public struct LocalBackendLauncher: Sendable {
         environment["XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS"] = currentEnvironment["XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS"] ?? String(performanceSettings.directDownloadMaxConnectionsForBackend)
         environment["XDL_DIRECT_DOWNLOAD_SEGMENT_MIN_BYTES"] = currentEnvironment["XDL_DIRECT_DOWNLOAD_SEGMENT_MIN_BYTES"] ?? String(performanceSettings.directDownloadSegmentMinBytes)
         environment["XDL_DIRECT_DOWNLOAD_SEGMENT_SIZE"] = currentEnvironment["XDL_DIRECT_DOWNLOAD_SEGMENT_SIZE"] ?? String(performanceSettings.directDownloadSegmentSizeBytes)
+        environment["XDL_QUEUE_NIGHT_DOWNLOAD_ENABLED"] = currentEnvironment["XDL_QUEUE_NIGHT_DOWNLOAD_ENABLED"] ?? String(performanceSettings.nightDownloadEnabled)
+        environment["XDL_QUEUE_NIGHT_START_HOUR"] = currentEnvironment["XDL_QUEUE_NIGHT_START_HOUR"] ?? String(performanceSettings.nightDownloadStartHour)
+        environment["XDL_QUEUE_NIGHT_END_HOUR"] = currentEnvironment["XDL_QUEUE_NIGHT_END_HOUR"] ?? String(performanceSettings.nightDownloadEndHour)
         let downloadRateLimit = currentEnvironment["XDL_DOWNLOAD_RATE_LIMIT"]
             ?? performanceSettings.downloadRateLimit.trimmingCharacters(in: .whitespacesAndNewlines)
         if !downloadRateLimit.isEmpty {

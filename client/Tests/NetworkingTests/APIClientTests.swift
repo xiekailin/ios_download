@@ -67,10 +67,11 @@ private let jobResponse = Data(#"""
     "source_url": "upload:song.mp3",
     "normalized_url": "file:/tmp/song.mp3",
     "provider": null,
-    "job_type": "audio_separation",
-    "status": "queued",
-    "progress": 0,
-    "downloaded_bytes": null,
+	    "job_type": "audio_separation",
+	    "status": "queued",
+	    "progress": 0,
+	    "priority": 0,
+	    "downloaded_bytes": null,
     "total_bytes": null,
     "speed_bytes_per_sec": null,
     "eta_seconds": null,
@@ -141,10 +142,97 @@ struct APIClientTests {
 
     let job = try await apiClient.retryJob(id: "job-1", token: "token-1")
 
-    #expect(job.id == "job-1")
-}
+	    #expect(job.id == "job-1")
+	}
 
-@Test func apiClientPreviewsJob() async throws {
+    @Test func apiClientPausesAndResumesJob() async throws {
+        let apiClient = APIClient(baseURL: URL(string: "http://127.0.0.1:18767")!, session: makeSession(), localSecret: "secret-1")
+        var requestedPaths: [String] = []
+
+        URLProtocolStub.handler = { request in
+            requestedPaths.append(request.url?.path ?? "")
+            #expect(request.httpMethod == "POST")
+            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer token-1")
+            #expect(request.value(forHTTPHeaderField: "X-XDownloader-Local-Secret") == "secret-1")
+            #expect(requestBodyString(request).isEmpty)
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, jobResponse)
+        }
+
+        _ = try await apiClient.pauseJob(id: "job-1", token: "token-1")
+        _ = try await apiClient.resumeJob(id: "job-1", token: "token-1")
+
+        #expect(requestedPaths == ["/api/v1/jobs/job-1/pause", "/api/v1/jobs/job-1/resume"])
+    }
+
+    @Test func apiClientSetsJobPriority() async throws {
+        let apiClient = APIClient(baseURL: URL(string: "http://127.0.0.1:18767")!, session: makeSession(), localSecret: "secret-1")
+
+        URLProtocolStub.handler = { request in
+            #expect(request.url?.path == "/api/v1/jobs/job-1/priority")
+            #expect(request.httpMethod == "POST")
+            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer token-1")
+            #expect(request.value(forHTTPHeaderField: "X-XDownloader-Local-Secret") == "secret-1")
+            #expect(requestBodyString(request).contains("\"priority\":30"))
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, jobResponse)
+        }
+
+        let job = try await apiClient.setJobPriority(id: "job-1", priority: 30, token: "token-1")
+
+        #expect(job.id == "job-1")
+    }
+
+    @Test func apiClientBatchRetriesJobs() async throws {
+        let apiClient = APIClient(baseURL: URL(string: "http://127.0.0.1:18767")!, session: makeSession(), localSecret: "secret-1")
+        let response = Data(#"""
+        {
+          "data": {
+            "items": [
+              {
+                "id": "job-1",
+                "device_id": "device-1",
+                "source_url": "https://x.com/demo/status/1",
+                "normalized_url": "https://x.com/demo/status/1",
+                "provider": null,
+                "job_type": "download",
+                "status": "queued",
+                "progress": 0,
+                "priority": 0,
+                "downloaded_bytes": null,
+                "total_bytes": null,
+                "speed_bytes_per_sec": null,
+                "eta_seconds": null,
+                "error_code": null,
+                "error_message": null,
+                "user_message": null,
+                "media_title": null,
+                "author_handle": null,
+                "thumbnail_url": null,
+                "artifact_id": null,
+                "selected_quality": null,
+                "created_at": "2026-04-27T00:00:00Z",
+                "updated_at": "2026-04-27T00:00:00Z",
+                "finished_at": null
+              }
+            ]
+          }
+        }
+        """#.utf8)
+
+        URLProtocolStub.handler = { request in
+            #expect(request.url?.path == "/api/v1/jobs/batch-retry")
+            #expect(request.httpMethod == "POST")
+            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer token-1")
+            #expect(request.value(forHTTPHeaderField: "X-XDownloader-Local-Secret") == "secret-1")
+            #expect(requestBodyString(request).isEmpty)
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, response)
+        }
+
+        let jobs = try await apiClient.batchRetryJobs(token: "token-1")
+
+        #expect(jobs.map(\.id) == ["job-1"])
+    }
+
+	@Test func apiClientPreviewsJob() async throws {
     let apiClient = APIClient(baseURL: URL(string: "http://127.0.0.1:18767")!, session: makeSession(), localSecret: "secret-1")
     let response = Data(#"""
     {

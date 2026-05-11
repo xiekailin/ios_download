@@ -57,6 +57,13 @@ def _get_nonnegative_int_env(name: str, default: int) -> int:
     return value
 
 
+def _get_hour_env(name: str, default: int) -> int:
+    value = _get_int_env(name, default)
+    if value < 0 or value > 23:
+        raise ValidationAppError(f"invalid hour for {name}", f"环境变量 {name} 必须在 0 到 23 之间。")
+    return value
+
+
 def _get_performance_mode_env() -> str:
     raw = os.getenv("XDL_PERFORMANCE_MODE", "balanced").strip().lower().replace("-", "_")
     aliases = {
@@ -163,6 +170,11 @@ class Settings:
     performance_mode: str = "balanced"
     download_worker_max_jobs: int = 2
     audio_separation_worker_max_jobs: int = 1
+    queue_platform_max_jobs: int = 2
+    queue_night_download_enabled: bool = False
+    queue_night_start_hour: int = 23
+    queue_night_end_hour: int = 7
+    queue_wakeup_interval_seconds: int = 60
     ytdlp_concurrent_fragments: int = 4
     direct_download_max_connections: int = 4
     direct_download_segment_min_bytes: int = 8 * 1024 * 1024
@@ -263,6 +275,11 @@ class Settings:
             performance_mode=performance_mode,
             download_worker_max_jobs=_get_positive_int_env("XDL_DOWNLOAD_WORKER_MAX_JOBS", worker_max_jobs),
             audio_separation_worker_max_jobs=_get_positive_int_env("XDL_AUDIO_SEPARATION_WORKER_MAX_JOBS", audio_separation_default),
+            queue_platform_max_jobs=_get_positive_int_env("XDL_QUEUE_PLATFORM_MAX_JOBS", 2),
+            queue_night_download_enabled=_get_bool_env("XDL_QUEUE_NIGHT_DOWNLOAD_ENABLED", False),
+            queue_night_start_hour=_get_hour_env("XDL_QUEUE_NIGHT_START_HOUR", 23),
+            queue_night_end_hour=_get_hour_env("XDL_QUEUE_NIGHT_END_HOUR", 7),
+            queue_wakeup_interval_seconds=_get_positive_int_env("XDL_QUEUE_WAKEUP_INTERVAL_SECONDS", 60),
             ytdlp_concurrent_fragments=_get_positive_int_env("XDL_YTDLP_CONCURRENT_FRAGMENTS", fragment_default),
             direct_download_max_connections=_get_positive_int_env("XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS", direct_download_default),
             direct_download_segment_min_bytes=_get_positive_int_env("XDL_DIRECT_DOWNLOAD_SEGMENT_MIN_BYTES", 8 * 1024 * 1024),

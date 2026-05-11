@@ -18,6 +18,7 @@ class JobStatus(StrEnum):
     DOWNLOADING = "downloading"
     MUXING = "muxing"
     STORING = "storing"
+    PAUSED = "paused"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELED = "canceled"
@@ -72,6 +73,7 @@ class Job:
     provider: str | None
     status: JobStatus
     progress: int
+    priority: int
     downloaded_bytes: int | None
     total_bytes: int | None
     speed_bytes_per_sec: int | None

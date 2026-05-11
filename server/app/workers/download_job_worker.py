@@ -35,6 +35,7 @@ _ARTIFACT_INVALID_CHARS_RE = re.compile(r"[\x00-\x1f\\/:*?\"<>|]+")
 _ARTIFACT_WHITESPACE_RE = re.compile(r"\s+")
 _BEST_MP4_FORMAT_SELECTOR = "bestvideo*[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo*+bestaudio/best"
 _FAST_MP4_FORMAT_SELECTOR = "best[ext=mp4]/bestvideo*[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+_COMPATIBLE_FORMAT_SELECTOR = "best/bestvideo*+bestaudio/bestaudio/best"
 _ARIA2C_DEFAULT_DOWNLOADER_ARGS = "aria2c:-x 8 -s 8 -k 1M"
 _ALLOWED_ARTIFACT_EXTENSIONS = frozenset({"mp4", "mov", "webm", "m4a", "mp3", "jpg", "jpeg", "png", "webp", "gif"})
 _PROGRESS_UPDATE_INTERVAL_SECONDS = 0.5
@@ -64,6 +65,11 @@ _DELEGATE_RATE_LIMIT_ERROR_MARKERS = (
     "rate limit",
     "rate-limit",
     "ratelimit",
+)
+_DELEGATE_FORMAT_ERROR_MARKERS = (
+    "requested format",
+    "format is not available",
+    "no video formats",
 )
 _DELEGATE_NON_RETRYABLE_ERROR_MARKERS = (
     "canceled",
@@ -408,6 +414,8 @@ class DownloadJobWorker:
     def _run_delegate_download_with_retries(self, *, job_id: str, command: list[str], source_url: str) -> None:
         retry_command = command
         did_downgrade_for_rate_limit = False
+        did_fallback_for_format = False
+        did_fallback_for_downloader = False
         for attempt in range(_DELEGATE_DOWNLOAD_RETRY_COUNT + 1):
             self._raise_if_job_canceled(job_id)
             if attempt > 0:
@@ -417,7 +425,18 @@ class DownloadJobWorker:
                 return
             except DownloadAppError as exc:
                 self._raise_if_job_canceled(job_id)
-                if attempt == _DELEGATE_DOWNLOAD_RETRY_COUNT or not self._is_retryable_delegate_download_error(exc):
+                if attempt == _DELEGATE_DOWNLOAD_RETRY_COUNT:
+                    raise
+                if (
+                    self._settings.performance_mode == "auto"
+                    and not did_fallback_for_format
+                    and self._is_format_delegate_download_error(exc)
+                ):
+                    retry_command = self._compatible_format_delegate_command(retry_command)
+                    did_fallback_for_format = True
+                    self._record_strategy_event(job_id, "格式不可用，已自动切换为兼容格式重试")
+                    continue
+                if not self._is_retryable_delegate_download_error(exc):
                     raise
                 if (
                     self._settings.performance_mode == "auto"
@@ -426,6 +445,16 @@ class DownloadJobWorker:
                 ):
                     retry_command = self._rate_limited_delegate_command(retry_command)
                     did_downgrade_for_rate_limit = True
+                    self._record_strategy_event(job_id, "平台限流，已自动降速并切换保守下载策略重试")
+                    continue
+                if (
+                    self._settings.performance_mode == "auto"
+                    and not did_fallback_for_downloader
+                    and self._has_external_downloader(retry_command)
+                ):
+                    retry_command = self._without_external_downloader(retry_command)
+                    did_fallback_for_downloader = True
+                    self._record_strategy_event(job_id, "外部下载器不稳定，已切换内置下载器重试")
 
     def _raise_if_job_canceled(self, job_id: str) -> None:
         current = self._jobs.get(job_id)
@@ -460,7 +489,16 @@ class DownloadJobWorker:
         message = exc.message.lower()
         return any(marker in message for marker in _DELEGATE_RATE_LIMIT_ERROR_MARKERS)
 
+    def _is_format_delegate_download_error(self, exc: DownloadAppError) -> bool:
+        message = exc.message.lower()
+        return any(marker in message for marker in _DELEGATE_FORMAT_ERROR_MARKERS)
+
+    def _record_strategy_event(self, job_id: str, message: str) -> None:
+        if self._jobs.get(job_id) is not None:
+            self._jobs.create_event(job_id, level="warning", event_type="strategy", message=message)
+
     def _rate_limited_delegate_command(self, command: list[str]) -> list[str]:
+        command = self._without_external_downloader(command)
         adjusted: list[str] = []
         skip_next = False
         saw_concurrent_fragments = False
@@ -476,9 +514,6 @@ class DownloadJobWorker:
                 except ValueError:
                     fragments = 2
                 adjusted.extend([arg, str(fragments)])
-                skip_next = True
-                continue
-            if arg in {"--downloader", "--downloader-args"}:
                 skip_next = True
                 continue
             adjusted.append(arg)
@@ -498,6 +533,36 @@ class DownloadJobWorker:
             separator_index = adjusted.index("--")
             return [*adjusted[:separator_index], *extra_args, *adjusted[separator_index:]]
         return [*adjusted, *extra_args]
+
+    def _compatible_format_delegate_command(self, command: list[str]) -> list[str]:
+        adjusted = list(command)
+        format_selector = "bestaudio/best" if "-x" in adjusted or "--audio-format" in adjusted else _COMPATIBLE_FORMAT_SELECTOR
+        if "-f" in adjusted:
+            index = adjusted.index("-f")
+            if index + 1 < len(adjusted):
+                adjusted[index + 1] = format_selector
+                return adjusted
+        insert_index = adjusted.index("--merge-output-format") if "--merge-output-format" in adjusted else self._delegate_source_separator_index(adjusted)
+        return [*adjusted[:insert_index], "-f", format_selector, *adjusted[insert_index:]]
+
+    def _without_external_downloader(self, command: list[str]) -> list[str]:
+        adjusted: list[str] = []
+        skip_next = False
+        for arg in command:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg in {"--downloader", "--downloader-args"}:
+                skip_next = True
+                continue
+            adjusted.append(arg)
+        return adjusted
+
+    def _has_external_downloader(self, command: list[str]) -> bool:
+        return "--downloader" in command or "--downloader-args" in command
+
+    def _delegate_source_separator_index(self, command: list[str]) -> int:
+        return command.index("--") if "--" in command else len(command)
 
     def _delegate_download_command(
         self,

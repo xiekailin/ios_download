@@ -50,6 +50,7 @@ class Database:
                     provider TEXT,
                     status TEXT NOT NULL,
                     progress INTEGER NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0,
                     downloaded_bytes INTEGER,
                     total_bytes INTEGER,
                     speed_bytes_per_sec INTEGER,
@@ -119,6 +120,7 @@ class Database:
             "speed_bytes_per_sec": "INTEGER",
             "eta_seconds": "INTEGER",
             "job_type": "TEXT NOT NULL DEFAULT 'download'",
+            "priority": "INTEGER NOT NULL DEFAULT 0",
         }
         for name, column_type in missing_columns.items():
             if name in columns:

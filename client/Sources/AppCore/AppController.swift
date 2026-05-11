@@ -26,6 +26,10 @@ public protocol ClientAPI: Sendable {
     func deleteYouTubeCookies(token: String) async throws -> YouTubeCookieStatus
     func cancelJob(id: String, token: String) async throws -> Job
     func retryJob(id: String, token: String) async throws -> Job
+    func pauseJob(id: String, token: String) async throws -> Job
+    func resumeJob(id: String, token: String) async throws -> Job
+    func setJobPriority(id: String, priority: Int, token: String) async throws -> Job
+    func batchRetryJobs(token: String) async throws -> [Job]
     func listJobs(token: String) async throws -> [Job]
     func listJobArtifacts(jobID: String, token: String) async throws -> [ArtifactSummary]
     func listJobLogs(jobID: String, token: String, limit: Int, afterID: Int?) async throws -> JobLogsResult
@@ -572,6 +576,95 @@ public final class AppController {
             try await jobsStore.saveJobs(store.jobs)
             store.setError(nil)
             startPolling(store: store)
+        } catch {
+            store.setError(error.localizedDescription)
+        }
+    }
+
+    public func pauseJob(id: String, store: JobStore) async {
+        guard let token = store.registration?.accessToken else {
+            store.setError("设备初始化失败，请重试。")
+            return
+        }
+        guard !store.isLoading else {
+            return
+        }
+        store.setLoading(true)
+        defer { store.setLoading(false) }
+        do {
+            let job = try await apiClient.pauseJob(id: id, token: token)
+            store.upsert(job)
+            try await jobsStore.saveJobs(store.jobs)
+            store.setError(nil)
+        } catch {
+            store.setError(error.localizedDescription)
+        }
+    }
+
+    public func resumeJob(id: String, store: JobStore) async {
+        guard let token = store.registration?.accessToken else {
+            store.setError("设备初始化失败，请重试。")
+            return
+        }
+        guard !store.isLoading else {
+            return
+        }
+        store.setLoading(true)
+        defer { store.setLoading(false) }
+        do {
+            let job = try await apiClient.resumeJob(id: id, token: token)
+            store.upsert(job)
+            try await jobsStore.saveJobs(store.jobs)
+            store.setError(nil)
+            startPolling(store: store)
+        } catch {
+            store.setError(error.localizedDescription)
+        }
+    }
+
+    public func setJobPriority(id: String, priority: Int, store: JobStore) async {
+        guard let token = store.registration?.accessToken else {
+            store.setError("设备初始化失败，请重试。")
+            return
+        }
+        guard !store.isLoading else {
+            return
+        }
+        store.setLoading(true)
+        defer { store.setLoading(false) }
+        do {
+            let job = try await apiClient.setJobPriority(id: id, priority: priority, token: token)
+            store.upsert(job)
+            try await jobsStore.saveJobs(store.jobs)
+            store.setError(nil)
+            if !job.status.isTerminal {
+                startPolling(store: store)
+            }
+        } catch {
+            store.setError(error.localizedDescription)
+        }
+    }
+
+    public func batchRetryJobs(store: JobStore) async {
+        guard let token = store.registration?.accessToken else {
+            store.setError("设备初始化失败，请重试。")
+            return
+        }
+        guard !store.isLoading else {
+            return
+        }
+        store.setLoading(true)
+        defer { store.setLoading(false) }
+        do {
+            let jobs = try await apiClient.batchRetryJobs(token: token)
+            for job in jobs {
+                store.upsert(job)
+            }
+            try await jobsStore.saveJobs(store.jobs)
+            store.setError(nil)
+            if !jobs.isEmpty {
+                startPolling(store: store)
+            }
         } catch {
             store.setError(error.localizedDescription)
         }

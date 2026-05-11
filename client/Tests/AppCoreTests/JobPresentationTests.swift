@@ -256,6 +256,7 @@ private func makePresentationJob(
     #expect(JobType.download.presentationTitle == "视频")
     #expect(JobType.audioDownload.presentationSystemImage == "music.note")
     #expect(JobStatus.downloading.presentationTitle == "下载中")
+    #expect(JobStatus.paused.presentationTitle == "已暂停")
     #expect(JobStatus.failed.presentationSystemImage == "exclamationmark.triangle.fill")
 }
 

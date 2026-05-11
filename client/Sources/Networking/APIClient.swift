@@ -129,6 +129,42 @@ public struct APIClient: Sendable, ClientAPI {
         return response.data.toDomain()
     }
 
+    public func pauseJob(id: String, token: String) async throws -> Job {
+        let endpoint = baseURL
+            .appending(path: "/api/v1/jobs")
+            .appending(component: id)
+            .appending(component: "pause")
+        let response: DataEnvelope<JobDTO> = try await sendWithoutBody(endpoint: endpoint, method: "POST", bearerToken: token)
+        return response.data.toDomain()
+    }
+
+    public func resumeJob(id: String, token: String) async throws -> Job {
+        let endpoint = baseURL
+            .appending(path: "/api/v1/jobs")
+            .appending(component: id)
+            .appending(component: "resume")
+        let response: DataEnvelope<JobDTO> = try await sendWithoutBody(endpoint: endpoint, method: "POST", bearerToken: token)
+        return response.data.toDomain()
+    }
+
+    public func setJobPriority(id: String, priority: Int, token: String) async throws -> Job {
+        let endpoint = baseURL
+            .appending(path: "/api/v1/jobs")
+            .appending(component: id)
+            .appending(component: "priority")
+        let payload = UpdateJobPriorityRequest(priority: priority)
+        let response: DataEnvelope<JobDTO> = try await send(endpoint: endpoint, method: "POST", body: payload, bearerToken: token)
+        return response.data.toDomain()
+    }
+
+    public func batchRetryJobs(token: String) async throws -> [Job] {
+        let endpoint = baseURL
+            .appending(path: "/api/v1/jobs")
+            .appending(component: "batch-retry")
+        let response: DataEnvelope<JobsListDTO> = try await sendWithoutBody(endpoint: endpoint, method: "POST", bearerToken: token)
+        return response.data.items.map { $0.toDomain() }
+    }
+
     public func listJobs(token: String) async throws -> [Job] {
         let endpoint = baseURL.appending(path: "/api/v1/jobs")
         let response: DataEnvelope<JobsListDTO> = try await sendWithoutBody(endpoint: endpoint, method: "GET", bearerToken: token)
@@ -531,6 +567,10 @@ private struct CreateJobRequest: Encodable {
     }
 }
 
+private struct UpdateJobPriorityRequest: Encodable {
+    let priority: Int
+}
+
 private struct DeviceRegistrationDTO: Decodable {
     let deviceID: String
     let accessToken: String
@@ -745,6 +785,7 @@ private struct JobDTO: Decodable {
     let jobType: JobType
     let status: JobStatus
     let progress: Int
+    let priority: Int
     let downloadedBytes: Int?
     let totalBytes: Int?
     let speedBytesPerSec: Int?
@@ -770,6 +811,7 @@ private struct JobDTO: Decodable {
         case jobType = "job_type"
         case status
         case progress
+        case priority
         case downloadedBytes = "downloaded_bytes"
         case totalBytes = "total_bytes"
         case speedBytesPerSec = "speed_bytes_per_sec"
@@ -797,6 +839,7 @@ private struct JobDTO: Decodable {
         self.jobType = try container.decodeIfPresent(JobType.self, forKey: .jobType) ?? .download
         self.status = try container.decode(JobStatus.self, forKey: .status)
         self.progress = try container.decode(Int.self, forKey: .progress)
+        self.priority = try container.decodeIfPresent(Int.self, forKey: .priority) ?? 0
         self.downloadedBytes = try container.decodeIfPresent(Int.self, forKey: .downloadedBytes)
         self.totalBytes = try container.decodeIfPresent(Int.self, forKey: .totalBytes)
         self.speedBytesPerSec = try container.decodeIfPresent(Int.self, forKey: .speedBytesPerSec)
@@ -824,6 +867,7 @@ private struct JobDTO: Decodable {
             jobType: jobType,
             status: status,
             progress: progress,
+            priority: priority,
             downloadedBytes: downloadedBytes,
             totalBytes: totalBytes,
             speedBytesPerSec: speedBytesPerSec,

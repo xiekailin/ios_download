@@ -71,6 +71,10 @@ class AppTests(unittest.TestCase):
         os.environ.pop("XDL_DOWNLOAD_RATE_LIMIT", None)
         os.environ.pop("XDL_YTDLP_EXTERNAL_DOWNLOADER", None)
         os.environ.pop("XDL_YTDLP_EXTERNAL_DOWNLOADER_ARGS", None)
+        os.environ.pop("XDL_QUEUE_NIGHT_DOWNLOAD_ENABLED", None)
+        os.environ.pop("XDL_QUEUE_NIGHT_START_HOUR", None)
+        os.environ.pop("XDL_QUEUE_NIGHT_END_HOUR", None)
+        os.environ.pop("XDL_QUEUE_WAKEUP_INTERVAL_SECONDS", None)
         self.container.close()
         self.temp_dir.cleanup()
 
@@ -225,6 +229,19 @@ class AppTests(unittest.TestCase):
 
         self.assertEqual(settings.ytdlp_format_strategy, "adaptive")
 
+    def test_settings_accept_night_download_queue_window(self) -> None:
+        os.environ["XDL_QUEUE_NIGHT_DOWNLOAD_ENABLED"] = "true"
+        os.environ["XDL_QUEUE_NIGHT_START_HOUR"] = "22"
+        os.environ["XDL_QUEUE_NIGHT_END_HOUR"] = "6"
+        os.environ["XDL_QUEUE_WAKEUP_INTERVAL_SECONDS"] = "30"
+
+        settings = Settings.from_env()
+
+        self.assertTrue(settings.queue_night_download_enabled)
+        self.assertEqual(settings.queue_night_start_hour, 22)
+        self.assertEqual(settings.queue_night_end_hour, 6)
+        self.assertEqual(settings.queue_wakeup_interval_seconds, 30)
+
     def test_container_startup_recovers_interrupted_active_jobs(self) -> None:
         device = DeviceRepository(self.container.database).create(
             name="Worker Device",
@@ -301,6 +318,59 @@ class AppTests(unittest.TestCase):
         self.assertEqual(runner.dispatched, [(job.id, JobType.DOWNLOAD)])
         self.assertEqual(self.container.job_service._repository.get(job.id).status, JobStatus.QUEUED)
 
+    def test_job_service_respects_night_download_window_before_dispatch(self) -> None:
+        device = DeviceRepository(self.container.database).create(
+            name="Worker Device",
+            platform=Platform.MACOS,
+            app_version="1.0",
+            token_hash="night-window-dispatch",
+        )
+        job = self.container.job_service._repository.create(
+            device_id=device.id,
+            source_url="https://www.bilibili.com/video/BV1sRoHB5EHC",
+            normalized_url="https://www.bilibili.com/video/BV1sRoHB5EHC",
+            selected_quality=None,
+        )
+
+        class FakeRunner:
+            def __init__(self) -> None:
+                self.dispatched: list[tuple[str, JobType]] = []
+
+            def dispatch(self, job_id: str, *, job_type: JobType = JobType.DOWNLOAD) -> bool:
+                self.dispatched.append((job_id, job_type))
+                return True
+
+            def close(self, *, wait: bool = True) -> None:
+                return None
+
+        settings = self.container.settings
+        settings.queue_night_download_enabled = True
+        settings.queue_night_start_hour = 23
+        settings.queue_night_end_hour = 7
+        settings.queue_wakeup_interval_seconds = 3600
+        runner = FakeRunner()
+        service = JobService(
+            self.container.job_service._repository,
+            runner,
+            self.container.artifact_service._artifacts,
+            self.container.job_service._events,
+            settings,
+        )
+        try:
+            self.assertTrue(service._is_queue_dispatch_allowed(hour=23))
+            self.assertTrue(service._is_queue_dispatch_allowed(hour=2))
+            self.assertFalse(service._is_queue_dispatch_allowed(hour=12))
+
+            with patch.object(service, "_is_queue_dispatch_allowed", return_value=False):
+                service.dispatch_queued()
+            self.assertEqual(runner.dispatched, [])
+
+            with patch.object(service, "_is_queue_dispatch_allowed", return_value=True):
+                service.dispatch_queued()
+            self.assertEqual(runner.dispatched, [(job.id, JobType.DOWNLOAD)])
+        finally:
+            service.close()
+
     def test_background_runner_keeps_audio_separation_single_flight(self) -> None:
         started: list[str] = []
         first_started = threading.Event()
@@ -367,6 +437,35 @@ class AppTests(unittest.TestCase):
             self.assertEqual(started[:2], ["audio", "download"])
         finally:
             release_audio.set()
+            runner.close(wait=True)
+
+    def test_background_runner_limits_same_platform_dispatches(self) -> None:
+        release_first = threading.Event()
+        first_started = threading.Event()
+        second_started = threading.Event()
+
+        class BlockingWorker:
+            def run(self, job_id: str) -> None:
+                if job_id == "x-1":
+                    first_started.set()
+                    release_first.wait(timeout=2)
+                if job_id == "x-2":
+                    second_started.set()
+
+        runner = BackgroundJobRunner(
+            BlockingWorker(),
+            max_jobs=2,
+            download_max_jobs=2,
+            audio_separation_max_jobs=1,
+        )
+        try:
+            self.assertTrue(runner.dispatch_if_available("x-1", job_type=JobType.DOWNLOAD, platform_key="x.com", platform_limit=1))
+            self.assertTrue(first_started.wait(timeout=1))
+            self.assertFalse(runner.dispatch_if_available("x-2", job_type=JobType.DOWNLOAD, platform_key="x.com", platform_limit=1))
+            self.assertFalse(second_started.wait(timeout=0.1))
+            self.assertTrue(runner.dispatch_if_available("yt-1", job_type=JobType.DOWNLOAD, platform_key="youtube.com", platform_limit=1))
+        finally:
+            release_first.set()
             runner.close(wait=True)
 
     def test_youtube_cookie_status_requires_device_authentication(self) -> None:
@@ -797,6 +896,61 @@ class AppTests(unittest.TestCase):
         self.assertEqual(retry.status_code, 200)
         self.assertEqual(retry.json()["data"]["id"], second.json()["data"]["id"])
         self.assertEqual(retry.json()["data"]["status"], "queued")
+
+    def test_pause_and_resume_queued_job(self) -> None:
+        headers = self.auth_headers()
+        created = self.client.post(
+            "/api/v1/jobs",
+            json={"url": "https://x.com/demo/status/paused"},
+            headers=headers,
+        )
+        job_id = created.json()["data"]["id"]
+
+        paused = self.client.post(f"/api/v1/jobs/{job_id}/pause", headers=headers)
+        resumed = self.client.post(f"/api/v1/jobs/{job_id}/resume", headers=headers)
+
+        self.assertEqual(paused.status_code, 200)
+        self.assertEqual(paused.json()["data"]["status"], "paused")
+        self.assertEqual(resumed.status_code, 200)
+        self.assertEqual(resumed.json()["data"]["status"], "queued")
+        events = self.container.job_service.list_events(job_id, limit=20)
+        self.assertTrue(any(event.event_type == "paused" for event in events))
+        self.assertTrue(any(event.event_type == "resumed" for event in events))
+
+    def test_set_job_priority_updates_queue_order(self) -> None:
+        headers = self.auth_headers()
+        first = self.client.post("/api/v1/jobs", json={"url": "https://x.com/demo/status/1"}, headers=headers)
+        second = self.client.post("/api/v1/jobs", json={"url": "https://youtube.com/watch?v=abc12345678"}, headers=headers)
+        first_id = first.json()["data"]["id"]
+        second_id = second.json()["data"]["id"]
+
+        response = self.client.post(f"/api/v1/jobs/{second_id}/priority", json={"priority": 80}, headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"]["priority"], 80)
+        queued = self.container.job_service._repository.list_queued_for_dispatch()
+        self.assertEqual([job.id for job in queued[:2]], [second_id, first_id])
+
+    def test_batch_retry_requeues_failed_and_canceled_jobs(self) -> None:
+        headers = self.auth_headers()
+        failed = self.client.post("/api/v1/jobs", json={"url": "https://x.com/demo/status/failed"}, headers=headers)
+        canceled = self.client.post("/api/v1/jobs", json={"url": "https://youtube.com/watch?v=cancel12345"}, headers=headers)
+        completed = self.client.post("/api/v1/jobs", json={"url": "https://www.bilibili.com/video/BV1sRoHB5EHC"}, headers=headers)
+        failed_id = failed.json()["data"]["id"]
+        canceled_id = canceled.json()["data"]["id"]
+        completed_id = completed.json()["data"]["id"]
+        self.container.job_service._repository.update_status(failed_id, status=JobStatus.FAILED, progress=100)
+        self.container.job_service._repository.update_status(canceled_id, status=JobStatus.CANCELED, progress=5)
+        self.container.job_service._repository.update_status(completed_id, status=JobStatus.COMPLETED, progress=100)
+
+        response = self.client.post("/api/v1/jobs/batch-retry", headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        ids = {item["id"] for item in response.json()["data"]["items"]}
+        self.assertEqual(ids, {failed_id, canceled_id})
+        self.assertEqual(self.container.job_service._repository.get(failed_id).status, JobStatus.QUEUED)
+        self.assertEqual(self.container.job_service._repository.get(canceled_id).status, JobStatus.QUEUED)
+        self.assertEqual(self.container.job_service._repository.get(completed_id).status, JobStatus.COMPLETED)
 
     def test_preview_job_returns_metadata_without_creating_job(self) -> None:
         headers = self.auth_headers()
@@ -2301,6 +2455,80 @@ class AppTests(unittest.TestCase):
         self.assertNotIn("--downloader", commands[1])
         self.assertNotIn("--downloader-args", commands[1])
         self.assertIn("--sleep-requests", commands[1])
+
+    def test_delegate_download_auto_mode_retries_format_error_with_compatible_format(self) -> None:
+        self.container.settings.performance_mode = "auto"
+        worker = DownloadJobWorker(
+            settings=self.container.settings,
+            jobs=self.container.job_service._repository,
+            artifacts=self.container.artifact_service._artifacts,
+            selector=self.container.job_service._runner.worker._selector,
+        )
+        commands: list[list[str]] = []
+
+        def fake_run_once(*, job_id: str, command: list[str], source_url: str) -> None:
+            commands.append(command)
+            if len(commands) == 1:
+                raise DownloadAppError("requested format not available")
+
+        command = [
+            "yt-dlp",
+            "-f",
+            "bestvideo*[ext=mp4]+bestaudio[ext=m4a]",
+            "--merge-output-format",
+            "mp4",
+            "--",
+            "https://x.com/demo/status/12345",
+        ]
+
+        with patch.object(worker, "_raise_if_job_canceled", return_value=None):
+            with patch.object(worker, "_run_delegate_download_once", side_effect=fake_run_once):
+                worker._run_delegate_download_with_retries(
+                    job_id="job-1",
+                    command=command,
+                    source_url="https://x.com/demo/status/12345",
+                )
+
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(commands[1][commands[1].index("-f") + 1], "best/bestvideo*+bestaudio/bestaudio/best")
+        self.assertEqual(commands[1][commands[1].index("--merge-output-format") + 1], "mp4")
+
+    def test_delegate_download_auto_mode_retries_external_downloader_error_with_builtin_downloader(self) -> None:
+        self.container.settings.performance_mode = "auto"
+        worker = DownloadJobWorker(
+            settings=self.container.settings,
+            jobs=self.container.job_service._repository,
+            artifacts=self.container.artifact_service._artifacts,
+            selector=self.container.job_service._runner.worker._selector,
+        )
+        commands: list[list[str]] = []
+
+        def fake_run_once(*, job_id: str, command: list[str], source_url: str) -> None:
+            commands.append(command)
+            if len(commands) == 1:
+                raise DownloadAppError("yt-dlp download timed out", "下载长时间没有进展，请稍后重试。")
+
+        command = [
+            "yt-dlp",
+            "--downloader",
+            "aria2c",
+            "--downloader-args",
+            "aria2c:-x 8 -s 8 -k 1M",
+            "--",
+            "https://x.com/demo/status/12345",
+        ]
+
+        with patch.object(worker, "_raise_if_job_canceled", return_value=None):
+            with patch.object(worker, "_run_delegate_download_once", side_effect=fake_run_once):
+                worker._run_delegate_download_with_retries(
+                    job_id="job-1",
+                    command=command,
+                    source_url="https://x.com/demo/status/12345",
+                )
+
+        self.assertEqual(len(commands), 2)
+        self.assertNotIn("--downloader", commands[1])
+        self.assertNotIn("--downloader-args", commands[1])
 
     def test_delegate_download_fails_after_timeout_retries_are_exhausted(self) -> None:
         worker = DownloadJobWorker(

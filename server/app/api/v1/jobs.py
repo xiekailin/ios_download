@@ -6,7 +6,7 @@ from app.api.deps import AppContainer, get_container, get_current_device
 from app.core.errors import ValidationAppError
 
 from app.domain.models import Device
-from app.schemas.jobs import ArtifactSummaryResponse, CreateJobRequest, DeleteHistoryResponse, JobArtifactsResponse, JobLogEventResponse, JobLogsResponse, JobPreviewResponse, JobResponse, JobsListResponse, PreviewJobRequest
+from app.schemas.jobs import ArtifactSummaryResponse, CreateJobRequest, DeleteHistoryResponse, JobArtifactsResponse, JobLogEventResponse, JobLogsResponse, JobPreviewResponse, JobResponse, JobsListResponse, PreviewJobRequest, UpdateJobPriorityRequest
 from app.schemas.responses import DataResponse
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -90,6 +90,15 @@ def delete_history(
     }
 
 
+@router.post("/batch-retry", response_model=DataResponse[JobsListResponse])
+def batch_retry_jobs(
+    device: Device = Depends(get_current_device),
+    app_container: AppContainer = Depends(get_container),
+) -> dict[str, JobsListResponse]:
+    jobs = app_container.job_service.retry_many(device)
+    return {"data": JobsListResponse(items=[JobResponse.model_validate(job) for job in jobs])}
+
+
 @router.get("/{job_id}/artifacts", response_model=DataResponse[JobArtifactsResponse])
 def list_job_artifacts(
     job_id: str,
@@ -158,6 +167,37 @@ def retry_job(
     app_container: AppContainer = Depends(get_container),
 ) -> dict[str, JobResponse]:
     job = app_container.job_service.retry(job_id, device)
+    return {"data": JobResponse.model_validate(job)}
+
+
+@router.post("/{job_id}/pause", response_model=DataResponse[JobResponse])
+def pause_job(
+    job_id: str,
+    device: Device = Depends(get_current_device),
+    app_container: AppContainer = Depends(get_container),
+) -> dict[str, JobResponse]:
+    job = app_container.job_service.pause(job_id, device)
+    return {"data": JobResponse.model_validate(job)}
+
+
+@router.post("/{job_id}/resume", response_model=DataResponse[JobResponse])
+def resume_job(
+    job_id: str,
+    device: Device = Depends(get_current_device),
+    app_container: AppContainer = Depends(get_container),
+) -> dict[str, JobResponse]:
+    job = app_container.job_service.resume(job_id, device)
+    return {"data": JobResponse.model_validate(job)}
+
+
+@router.post("/{job_id}/priority", response_model=DataResponse[JobResponse])
+def set_job_priority(
+    job_id: str,
+    payload: UpdateJobPriorityRequest,
+    device: Device = Depends(get_current_device),
+    app_container: AppContainer = Depends(get_container),
+) -> dict[str, JobResponse]:
+    job = app_container.job_service.set_priority(job_id, device, payload.priority)
     return {"data": JobResponse.model_validate(job)}
 
 

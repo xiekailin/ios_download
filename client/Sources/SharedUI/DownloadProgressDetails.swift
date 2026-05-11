@@ -61,7 +61,7 @@ public struct DownloadProgressDetails: View {
             .green
         case .failed:
             .red
-        case .canceled:
+        case .canceled, .paused:
             .secondary
         case .created, .queued:
             .orange

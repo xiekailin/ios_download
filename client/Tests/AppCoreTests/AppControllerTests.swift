@@ -52,6 +52,10 @@ actor MockAPIClient: ClientAPI {
     var deletedHistoryCalls = 0
     var deleteHistoryResult = DeleteHistoryResult(deletedCount: 0, skippedActiveCount: 0)
     var retriedJobIDs: [String] = []
+    var pausedJobIDs: [String] = []
+    var resumedJobIDs: [String] = []
+    var priorityUpdates: [(id: String, priority: Int)] = []
+    var batchRetryCalls = 0
     var registerCalls = 0
     var registeredBootstrapCodes: [String?] = []
     var createJobCalls = 0
@@ -69,6 +73,10 @@ actor MockAPIClient: ClientAPI {
     var deleteHistoryError: Error?
     var deleteJobError: Error?
     var retryJobError: Error?
+    var pauseJobError: Error?
+    var resumeJobError: Error?
+    var setPriorityError: Error?
+    var batchRetryError: Error?
     var previewResult = JobPreview(
         sourceURL: "https://x.com/demo/status/1",
         normalizedURL: "https://x.com/demo/status/1",
@@ -105,6 +113,10 @@ actor MockAPIClient: ClientAPI {
         registerCalls += 1
         registeredBootstrapCodes.append(bootstrapCode)
         return registration
+    }
+
+    func setJobs(_ jobs: [Job]) {
+        self.jobs = jobs
     }
 
     func previewJob(url: String, jobType: JobType, token: String) async throws -> JobPreview {
@@ -247,6 +259,38 @@ actor MockAPIClient: ClientAPI {
         return jobs.first(where: { $0.id == id }) ?? jobs[0]
     }
 
+    func pauseJob(id: String, token: String) async throws -> Job {
+        pausedJobIDs.append(id)
+        if let pauseJobError {
+            throw pauseJobError
+        }
+        return jobs.first(where: { $0.id == id }) ?? jobs[0]
+    }
+
+    func resumeJob(id: String, token: String) async throws -> Job {
+        resumedJobIDs.append(id)
+        if let resumeJobError {
+            throw resumeJobError
+        }
+        return jobs.first(where: { $0.id == id }) ?? jobs[0]
+    }
+
+    func setJobPriority(id: String, priority: Int, token: String) async throws -> Job {
+        priorityUpdates.append((id: id, priority: priority))
+        if let setPriorityError {
+            throw setPriorityError
+        }
+        return jobs.first(where: { $0.id == id }) ?? jobs[0]
+    }
+
+    func batchRetryJobs(token: String) async throws -> [Job] {
+        batchRetryCalls += 1
+        if let batchRetryError {
+            throw batchRetryError
+        }
+        return jobs
+    }
+
     func setDownloadArtifactResult(_ result: DownloadedArtifact) {
         downloadArtifactResult = result
     }
@@ -293,7 +337,7 @@ actor MockAPIClient: ClientAPI {
     }
 }
 
-func makeJob(id: String = "job-1", now: Date = Date()) -> Job {
+func makeJob(id: String = "job-1", status: JobStatus = .queued, priority: Int = 0, now: Date = Date()) -> Job {
     Job(
         id: id,
         deviceID: "device-1",
@@ -301,8 +345,9 @@ func makeJob(id: String = "job-1", now: Date = Date()) -> Job {
         normalizedURL: "https://x.com/demo/status/1",
         provider: nil,
         jobType: .download,
-        status: .queued,
+        status: status,
         progress: 0,
+        priority: priority,
         errorCode: nil,
         errorMessage: nil,
         userMessage: nil,
@@ -313,7 +358,7 @@ func makeJob(id: String = "job-1", now: Date = Date()) -> Job {
         selectedQuality: nil,
         createdAt: now,
         updatedAt: now,
-        finishedAt: nil
+        finishedAt: status.isTerminal ? now : nil
     )
 }
 
@@ -1170,6 +1215,86 @@ func makeStore(apiBaseURL: URL = URL(string: "http://127.0.0.1:18767")!, bootstr
         #expect(!store.isLoading)
     }
     #expect(await apiClient.retriedJobIDs == ["job-1"])
+}
+
+@Test func pauseAndResumeJobUpdateLocalRecord() async throws {
+    let registration = DeviceRegistration(deviceID: "device-1", accessToken: "token-1")
+    let pausedJob = makeJob(id: "job-1", status: .paused)
+    let resumedJob = makeJob(id: "job-1", status: .queued)
+    let apiClient = MockAPIClient(registration: registration, jobs: [pausedJob])
+    let controller = await makeController(apiClient: apiClient)
+    let store = await makeStore()
+
+    await MainActor.run {
+        store.setRegistration(registration)
+        store.replaceJobs([makeJob(id: "job-1", status: .queued)])
+    }
+    await controller.pauseJob(id: "job-1", store: store)
+
+    await MainActor.run {
+        #expect(store.jobs[0].status == .paused)
+        #expect(store.errorMessage == nil)
+    }
+    #expect(await apiClient.pausedJobIDs == ["job-1"])
+
+    await apiClient.setJobs([resumedJob])
+    await controller.resumeJob(id: "job-1", store: store)
+
+    await MainActor.run {
+        #expect(store.jobs[0].status == .queued)
+        #expect(store.isPolling)
+    }
+    #expect(await apiClient.resumedJobIDs == ["job-1"])
+}
+
+@Test func setJobPriorityUpdatesLocalRecord() async throws {
+    let registration = DeviceRegistration(deviceID: "device-1", accessToken: "token-1")
+    let prioritizedJob = makeJob(id: "job-1", priority: 30)
+    let apiClient = MockAPIClient(registration: registration, jobs: [prioritizedJob])
+    let controller = await makeController(apiClient: apiClient)
+    let store = await makeStore()
+
+    await MainActor.run {
+        store.setRegistration(registration)
+        store.replaceJobs([makeJob(id: "job-1")])
+    }
+    await controller.setJobPriority(id: "job-1", priority: 30, store: store)
+
+    await MainActor.run {
+        #expect(store.jobs[0].priority == 30)
+        #expect(store.errorMessage == nil)
+    }
+    let updates = await apiClient.priorityUpdates
+    #expect(updates.count == 1)
+    #expect(updates.first?.id == "job-1")
+    #expect(updates.first?.priority == 30)
+}
+
+@Test func batchRetryJobsUpdatesRetryableRecordsAndStartsPolling() async throws {
+    let registration = DeviceRegistration(deviceID: "device-1", accessToken: "token-1")
+    let retriedJobs = [
+        makeJob(id: "job-1", status: .queued),
+        makeJob(id: "job-2", status: .queued)
+    ]
+    let apiClient = MockAPIClient(registration: registration, jobs: retriedJobs)
+    let controller = await makeController(apiClient: apiClient)
+    let store = await makeStore()
+
+    await MainActor.run {
+        store.setRegistration(registration)
+        store.replaceJobs([
+            makeJob(id: "job-1", status: .failed),
+            makeJob(id: "job-2", status: .canceled)
+        ])
+    }
+    await controller.batchRetryJobs(store: store)
+
+    await MainActor.run {
+        #expect(store.jobs.allSatisfy { $0.status == .queued })
+        #expect(store.errorMessage == nil)
+        #expect(store.isPolling)
+    }
+    #expect(await apiClient.batchRetryCalls == 1)
 }
 
 @Test func deleteArtifactKeepsLocalJobRecord() async throws {

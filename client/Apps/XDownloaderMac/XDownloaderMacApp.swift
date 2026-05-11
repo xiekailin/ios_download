@@ -27,6 +27,8 @@ private enum MacNativeStyle {
             .red
         case .canceled:
             .secondary
+        case .paused:
+            .secondary
         case .downloading, .resolving, .resolved, .muxing, .storing:
             .accentColor
         case .created, .queued:
@@ -40,6 +42,47 @@ private enum MacNativeStyle {
 
     static func jobTypeSymbol(_ jobType: JobType) -> String {
         jobType.presentationSystemImage
+    }
+}
+
+private struct TransferSpeedSparkline: View {
+    let samples: [TransferSpeedSample]
+
+    var body: some View {
+        GeometryReader { geometry in
+            let values = samples.map(\.bytesPerSecond)
+            let peak = max(values.max() ?? 1, 1)
+            let width = max(geometry.size.width, 1)
+            let height = max(geometry.size.height, 1)
+
+            ZStack(alignment: .bottomLeading) {
+                Rectangle()
+                    .fill(MacNativeStyle.subtleBackground)
+                Path { path in
+                    guard !values.isEmpty else {
+                        path.move(to: CGPoint(x: 0, y: height))
+                        path.addLine(to: CGPoint(x: width, y: height))
+                        return
+                    }
+                    for (index, value) in values.enumerated() {
+                        let x = values.count == 1 ? width : width * CGFloat(index) / CGFloat(values.count - 1)
+                        let y = height - (CGFloat(value) / CGFloat(peak)) * height
+                        if index == 0 {
+                            path.move(to: CGPoint(x: x, y: y))
+                        } else {
+                            path.addLine(to: CGPoint(x: x, y: y))
+                        }
+                    }
+                }
+                .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+            }
+        }
+        .frame(height: 64)
+        .clipShape(RoundedRectangle(cornerRadius: MacNativeStyle.cornerRadius))
+        .overlay(
+            RoundedRectangle(cornerRadius: MacNativeStyle.cornerRadius)
+                .stroke(MacNativeStyle.border, lineWidth: 1)
+        )
     }
 }
 
@@ -71,6 +114,9 @@ struct XDownloaderMacApp: App {
     @State private var settingsSaveMessage: String?
     @State private var isRestartingBackend = false
     @State private var activeFailureRecoveryJobID: Job.ID?
+    @State private var activeQueueActionJobID: Job.ID?
+    @State private var isBatchRetryingJobs = false
+    @State private var telemetryByJobID: [Job.ID: TransferTelemetry] = [:]
     private static let localSettings = makeLocalSettings()
     private static let localSecret = localSettings.localBackendSecret
     private static let localBaseURL = URL(string: "http://127.0.0.1:18767")!
@@ -126,6 +172,10 @@ struct XDownloaderMacApp: App {
 
     private var attentionJobs: [Job] {
         filteredJobs.filter { $0.status == .failed || $0.status == .canceled }
+    }
+
+    private var retryableJobs: [Job] {
+        store.jobs.filter { $0.status == .failed || $0.status == .canceled }
     }
 
     private static func makeLocalSettings() -> AppSettings {
@@ -283,6 +333,16 @@ struct XDownloaderMacApp: App {
             }
         }
         previousJobStatuses = Dictionary(uniqueKeysWithValues: jobs.map { ($0.id, $0.status) })
+    }
+
+    private func recordTransferTelemetry(for jobs: [Job]) {
+        let currentJobIDs = Set(jobs.map(\.id))
+        var nextTelemetry = telemetryByJobID.filter { currentJobIDs.contains($0.key) }
+        for job in jobs {
+            let telemetry = nextTelemetry[job.id] ?? TransferTelemetry()
+            nextTelemetry[job.id] = telemetry.recording(job: job)
+        }
+        telemetryByJobID = nextTelemetry
     }
 
     private func sendCompletionNotification(for job: Job) {
@@ -465,6 +525,11 @@ struct XDownloaderMacApp: App {
                     Text(jobTypeTitle(job.jobType))
                     Text("·")
                     Text(jobStatusTitle(job.status))
+                    if job.priority != 0, !job.status.isTerminal {
+                        Text("·")
+                        Text("优先 \(job.priority)")
+                            .monospacedDigit()
+                    }
                     if let speed = job.speedText, !job.status.isTerminal {
                         Text("·")
                         Text(speed)
@@ -489,6 +554,31 @@ struct XDownloaderMacApp: App {
             }
         }
         .padding(.vertical, 3)
+    }
+
+    private func activeSidebarRow(_ job: Job) -> some View {
+        sidebarRow(job)
+            .tag(job.id)
+            .contextMenu {
+                activeJobContextMenu(for: job)
+            }
+    }
+
+    @ViewBuilder
+    private func activeJobContextMenu(for job: Job) -> some View {
+        if job.status == .queued {
+            Button("暂停") {
+                pauseQueuedJob(job)
+            }
+        }
+        if job.status == .paused {
+            Button("继续") {
+                resumeQueuedJob(job)
+            }
+        }
+        Button("取消任务", role: .destructive) {
+            cancelActiveJob(job)
+        }
     }
 
     private var sidebarHeader: some View {
@@ -528,6 +618,18 @@ struct XDownloaderMacApp: App {
     private var sidebarFooter: some View {
         VStack(spacing: 8) {
             Divider()
+            if !retryableJobs.isEmpty {
+                Button {
+                    batchRetryFailedJobs()
+                } label: {
+                    Label(isBatchRetryingJobs ? "正在重试…" : "批量重试失败任务", systemImage: "arrow.clockwise.circle")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.regular)
+                .disabled(store.isLoading || isBatchRetryingJobs)
+                .padding(.horizontal, 12)
+            }
             Button(role: .destructive) {
                 isClearHistoryConfirmationPresented = true
             } label: {
@@ -573,6 +675,127 @@ struct XDownloaderMacApp: App {
             }
             Spacer()
             TaskStatusBadge(status: job.status)
+        }
+    }
+
+    private func queueManagementSection(for job: Job) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    queueStatusActions(for: job)
+                }
+                VStack(alignment: .leading, spacing: 8) {
+                    queueStatusActions(for: job)
+                }
+            }
+
+            if job.status == .queued || job.status == .paused {
+                HStack(spacing: 10) {
+                    Label("优先级 \(job.priority)", systemImage: "flag")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .frame(minWidth: 92, alignment: .leading)
+
+                    Button {
+                        setPriority(for: job, value: job.priority + 10)
+                    } label: {
+                        Label("提高", systemImage: "arrow.up.circle")
+                    }
+                    .controlSize(.small)
+                    .disabled(store.isLoading || activeQueueActionJobID != nil || job.priority >= 100)
+
+                    Button {
+                        setPriority(for: job, value: job.priority - 10)
+                    } label: {
+                        Label("降低", systemImage: "arrow.down.circle")
+                    }
+                    .controlSize(.small)
+                    .disabled(store.isLoading || activeQueueActionJobID != nil || job.priority <= -100)
+
+                    Button {
+                        setPriority(for: job, value: 0)
+                    } label: {
+                        Label("重置", systemImage: "arrow.counterclockwise")
+                    }
+                    .controlSize(.small)
+                    .disabled(store.isLoading || activeQueueActionJobID != nil || job.priority == 0)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func speedTelemetrySection(for job: Job) -> some View {
+        let telemetry = telemetryByJobID[job.id] ?? TransferTelemetry()
+        let bottleneck = telemetry.bottleneck(for: job)
+        return VStack(alignment: .leading, spacing: 10) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 120), alignment: .leading)], alignment: .leading, spacing: 8) {
+                speedMetric("实时", value: job.speedText ?? "0 KB/s", systemImage: "speedometer")
+                speedMetric("平均", value: telemetry.averageSpeedText, systemImage: "chart.line.uptrend.xyaxis")
+                speedMetric("峰值", value: telemetry.peakSpeedText, systemImage: "bolt")
+            }
+
+            Label(bottleneck.title, systemImage: bottleneck.systemImage)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(MacNativeStyle.statusColor(job.status))
+
+            TransferSpeedSparkline(samples: telemetry.samples)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func speedMetric(_ title: String, value: String, systemImage: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: systemImage)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                Text(value)
+                    .font(.caption.monospacedDigit().weight(.medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(8)
+        .background(MacNativeStyle.subtleBackground, in: RoundedRectangle(cornerRadius: MacNativeStyle.cornerRadius))
+    }
+
+    @ViewBuilder
+    private func queueStatusActions(for job: Job) -> some View {
+        if activeQueueActionJobID == job.id {
+            ProgressView()
+                .controlSize(.small)
+        }
+        if job.status == .queued {
+            Button {
+                pauseQueuedJob(job)
+            } label: {
+                Label("暂停", systemImage: "pause.circle")
+            }
+            .buttonStyle(.bordered)
+            .disabled(store.isLoading || activeQueueActionJobID != nil)
+        }
+        if job.status == .paused {
+            Button {
+                resumeQueuedJob(job)
+            } label: {
+                Label("继续", systemImage: "play.circle")
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(store.isLoading || activeQueueActionJobID != nil)
+        }
+        if !job.status.isTerminal {
+            Button(role: .destructive) {
+                cancelActiveJob(job)
+            } label: {
+                Label("取消任务", systemImage: "xmark.circle")
+            }
+            .buttonStyle(.bordered)
+            .disabled(store.isLoading || activeQueueActionJobID != nil)
         }
     }
 
@@ -909,6 +1132,53 @@ struct XDownloaderMacApp: App {
         }
     }
 
+    private func batchRetryFailedJobs() {
+        guard !isBatchRetryingJobs, !store.isLoading, !retryableJobs.isEmpty else { return }
+        isBatchRetryingJobs = true
+        resetArtifactState()
+        Task {
+            await controller.batchRetryJobs(store: store)
+            isBatchRetryingJobs = false
+        }
+    }
+
+    private func pauseQueuedJob(_ job: Job) {
+        guard activeQueueActionJobID == nil, !store.isLoading else { return }
+        activeQueueActionJobID = job.id
+        Task {
+            await controller.pauseJob(id: job.id, store: store)
+            activeQueueActionJobID = nil
+        }
+    }
+
+    private func resumeQueuedJob(_ job: Job) {
+        guard activeQueueActionJobID == nil, !store.isLoading else { return }
+        activeQueueActionJobID = job.id
+        Task {
+            await controller.resumeJob(id: job.id, store: store)
+            activeQueueActionJobID = nil
+        }
+    }
+
+    private func cancelActiveJob(_ job: Job) {
+        guard activeQueueActionJobID == nil, !store.isLoading else { return }
+        activeQueueActionJobID = job.id
+        Task {
+            await controller.cancelJob(id: job.id, store: store)
+            activeQueueActionJobID = nil
+        }
+    }
+
+    private func setPriority(for job: Job, value: Int) {
+        guard activeQueueActionJobID == nil, !store.isLoading else { return }
+        activeQueueActionJobID = job.id
+        let boundedValue = min(100, max(-100, value))
+        Task {
+            await controller.setJobPriority(id: job.id, priority: boundedValue, store: store)
+            activeQueueActionJobID = nil
+        }
+    }
+
     private func performFailureRecovery(_ advice: FailureRecoveryAdvice, for job: Job) {
         switch advice.action {
         case .retry:
@@ -1226,6 +1496,18 @@ struct XDownloaderMacApp: App {
                 DownloadProgressDetails(job: job)
             }
 
+            Divider()
+            inspectorSection("速度", systemImage: "waveform.path.ecg") {
+                speedTelemetrySection(for: job)
+            }
+
+            if !job.status.isTerminal {
+                Divider()
+                inspectorSection("队列", systemImage: "list.number") {
+                    queueManagementSection(for: job)
+                }
+            }
+
             if let advice = job.failureRecoveryAdvice {
                 Divider()
                 inspectorSection("诊断建议", systemImage: "stethoscope") {
@@ -1273,10 +1555,9 @@ struct XDownloaderMacApp: App {
 
                     List(selection: $selectedJobID) {
                         if !activeJobs.isEmpty {
-                            Section("下载中") {
+                            Section("进行中与队列") {
                                 ForEach(activeJobs) { job in
-                                    sidebarRow(job)
-                                        .tag(job.id)
+                                    activeSidebarRow(job)
                                 }
                             }
                         }
@@ -1439,6 +1720,7 @@ struct XDownloaderMacApp: App {
             .task { await refreshBackendHealthPeriodically() }
             .onChange(of: store.jobs) { _, jobs in
                 updateCompletionNotifications(for: jobs)
+                recordTransferTelemetry(for: jobs)
                 if let selectedJobID, jobs.contains(where: { $0.id == selectedJobID }) {
                     return
                 }
@@ -1490,6 +1772,7 @@ private struct MacDownloadPerformanceSettingsView: View {
     private let fragmentOptions = [1, 4, 8, 16]
     private let segmentSizeOptions = [4 * 1024 * 1024, 8 * 1024 * 1024, 16 * 1024 * 1024]
     private let ffmpegThreadOptions = [0, 1, 2, 4, 8]
+    private let hourOptions = Array(0...23)
     private var usesAutomaticPerformance: Bool { performance.performanceMode == .automatic }
 
     var body: some View {
@@ -1553,6 +1836,24 @@ private struct MacDownloadPerformanceSettingsView: View {
                     .textFieldStyle(.roundedBorder)
             }
 
+            Section("队列") {
+                Toggle("夜间下载", isOn: $performance.nightDownloadEnabled)
+
+                Picker("开始时间", selection: $performance.nightDownloadStartHour) {
+                    ForEach(hourOptions, id: \.self) { value in
+                        Text(hourTitle(value)).tag(value)
+                    }
+                }
+                .disabled(!performance.nightDownloadEnabled)
+
+                Picker("结束时间", selection: $performance.nightDownloadEndHour) {
+                    ForEach(hourOptions, id: \.self) { value in
+                        Text(hourTitle(value)).tag(value)
+                    }
+                }
+                .disabled(!performance.nightDownloadEnabled)
+            }
+
             Section {
                 HStack {
                     Button("恢复均衡默认值", action: resetToBalanced)
@@ -1584,5 +1885,9 @@ private struct MacDownloadPerformanceSettingsView: View {
 
     private func byteSizeTitle(_ value: Int) -> String {
         "\(value / 1024 / 1024) MB"
+    }
+
+    private func hourTitle(_ value: Int) -> String {
+        String(format: "%02d:00", value)
     }
 }

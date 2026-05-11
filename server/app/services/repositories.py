@@ -17,6 +17,7 @@ _ACTIVE_JOB_STATUSES = (
     JobStatus.DOWNLOADING,
     JobStatus.MUXING,
     JobStatus.STORING,
+    JobStatus.PAUSED,
 )
 
 _TERMINAL_JOB_STATUSES = (
@@ -141,6 +142,7 @@ class JobRepository:
             provider=None,
             status=JobStatus.QUEUED,
             progress=0,
+            priority=0,
             downloaded_bytes=None,
             total_bytes=None,
             speed_bytes_per_sec=None,
@@ -163,11 +165,11 @@ class JobRepository:
                 conn.execute(
                     """
                     INSERT INTO jobs (
-                        id, device_id, source_url, normalized_url, job_type, dedupe_key, is_active, provider, status, progress,
+                        id, device_id, source_url, normalized_url, job_type, dedupe_key, is_active, provider, status, progress, priority,
                         downloaded_bytes, total_bytes, speed_bytes_per_sec, eta_seconds,
                         error_code, error_message, user_message, media_title, author_handle,
                         thumbnail_url, artifact_id, selected_quality, created_at, updated_at, finished_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         job.id,
@@ -180,6 +182,7 @@ class JobRepository:
                         job.provider,
                         job.status.value,
                         job.progress,
+                        job.priority,
                         job.downloaded_bytes,
                         job.total_bytes,
                         job.speed_bytes_per_sec,
@@ -234,6 +237,18 @@ class JobRepository:
             rows = conn.execute(
                 f"SELECT * FROM jobs WHERE status IN ({placeholders}) ORDER BY created_at ASC",
                 tuple(status.value for status in _ACTIVE_JOB_STATUSES),
+            ).fetchall()
+        return [_row_to_job(row) for row in rows]
+
+    def list_queued_for_dispatch(self) -> list[Job]:
+        with self._database.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status = ?
+                ORDER BY priority DESC, created_at ASC
+                """,
+                (JobStatus.QUEUED.value,),
             ).fetchall()
         return [_row_to_job(row) for row in rows]
 
@@ -368,6 +383,14 @@ class JobRepository:
                     finished_at.isoformat() if finished_at else None,
                     job_id,
                 ),
+            )
+            conn.commit()
+
+    def update_priority(self, job_id: str, priority: int) -> None:
+        with self._database.connection() as conn:
+            conn.execute(
+                "UPDATE jobs SET priority = ?, updated_at = ? WHERE id = ?",
+                (priority, utc_now().isoformat(), job_id),
             )
             conn.commit()
 
@@ -564,6 +587,7 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         provider=row["provider"],
         status=JobStatus(row["status"]),
         progress=row["progress"],
+        priority=row["priority"],
         downloaded_bytes=row["downloaded_bytes"],
         total_bytes=row["total_bytes"],
         speed_bytes_per_sec=row["speed_bytes_per_sec"],

@@ -731,6 +731,9 @@ struct LocalBackendLauncherTests {
     #expect(environment["XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS"] == "4")
     #expect(environment["XDL_DIRECT_DOWNLOAD_SEGMENT_MIN_BYTES"] == "8388608")
     #expect(environment["XDL_DIRECT_DOWNLOAD_SEGMENT_SIZE"] == "4194304")
+    #expect(environment["XDL_QUEUE_NIGHT_DOWNLOAD_ENABLED"] == "false")
+    #expect(environment["XDL_QUEUE_NIGHT_START_HOUR"] == "23")
+    #expect(environment["XDL_QUEUE_NIGHT_END_HOUR"] == "7")
 }
 
 @Test func localBackendLauncherResolvesAutomaticPerformanceSettings() {
@@ -758,7 +761,10 @@ struct LocalBackendLauncherTests {
         simultaneousDownloadJobs: 3,
         ytdlpConcurrentFragments: 8,
         ffmpegThreadCount: 4,
-        downloadRateLimit: "5M"
+        downloadRateLimit: "5M",
+        nightDownloadEnabled: true,
+        nightDownloadStartHour: 22,
+        nightDownloadEndHour: 6
     )
 
     let environment = LocalBackendLauncher.defaultEnvironment(performanceSettings: performance)
@@ -771,6 +777,9 @@ struct LocalBackendLauncherTests {
     #expect(environment["XDL_DIRECT_DOWNLOAD_MAX_CONNECTIONS"] == "8")
     #expect(environment["XDL_DIRECT_DOWNLOAD_SEGMENT_MIN_BYTES"] == "16777216")
     #expect(environment["XDL_DIRECT_DOWNLOAD_SEGMENT_SIZE"] == "8388608")
+    #expect(environment["XDL_QUEUE_NIGHT_DOWNLOAD_ENABLED"] == "true")
+    #expect(environment["XDL_QUEUE_NIGHT_START_HOUR"] == "22")
+    #expect(environment["XDL_QUEUE_NIGHT_END_HOUR"] == "6")
 }
 
 @Test func localBackendLauncherDisablesDirectDownloadAccelerationWhenRequested() {

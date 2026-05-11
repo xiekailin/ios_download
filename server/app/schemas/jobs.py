@@ -23,6 +23,10 @@ class RetryJobRequest(APIModel):
     pass
 
 
+class UpdateJobPriorityRequest(APIModel):
+    priority: int = Field(ge=-100, le=100)
+
+
 class PreviewJobRequest(APIModel):
     url: str = Field(min_length=1, max_length=1000)
     job_type: JobType = JobType.DOWNLOAD
@@ -58,6 +62,7 @@ class JobResponse(APIModel):
     provider: str | None
     status: JobStatus
     progress: int
+    priority: int
     downloaded_bytes: int | None
     total_bytes: int | None
     speed_bytes_per_sec: int | None

@@ -41,7 +41,7 @@ public struct TaskStatusBadge: View {
 
     private var foregroundColor: Color {
         switch status {
-        case .completed, .downloading, .resolving, .resolved, .muxing, .storing, .created, .queued:
+        case .completed, .downloading, .resolving, .resolved, .muxing, .storing, .created, .queued, .paused:
             Color(red: 0.04, green: 0.045, blue: 0.052)
         case .failed, .canceled:
             .white
@@ -54,12 +54,14 @@ public struct TaskStatusBadge: View {
         case .completed: .green
         case .failed: .red
         case .canceled: .secondary
+        case .paused: .secondary
         case .downloading, .resolving, .resolved, .muxing, .storing: .accentColor
         case .created, .queued: .orange
         #else
         case .completed: Color(red: 0.50, green: 0.78, blue: 0.60)
         case .failed: Color(red: 0.70, green: 0.22, blue: 0.24)
         case .canceled: Color(red: 0.40, green: 0.43, blue: 0.46)
+        case .paused: Color(red: 0.72, green: 0.74, blue: 0.76)
         case .downloading, .resolving, .resolved, .muxing, .storing: Color(red: 0.58, green: 0.88, blue: 0.98)
         case .created, .queued: Color(red: 0.91, green: 0.76, blue: 0.48)
         #endif
